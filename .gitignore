@@ -1,0 +1,13 @@
+# Directories
+.ipynb_checkpoints
+.stfolder
+.trash
+.idea
+debug
+exp
+__pycache__/
+**/__pycache__/
+
+# Files
+*.sh
+.stignore
