@@ -6,7 +6,7 @@ import glob
 import logging
 import time
 from math import ceil, floor
-from os.path import exists
+from os.path import exists, dirname
 from typing import Union
 
 import torch.nn.functional as F
@@ -15,12 +15,14 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import BartTokenizer, AdamW, get_cosine_schedule_with_warmup
 
+from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg
+from models.config import get_model_config, get_tokenizer
 from models.encoder import EncoderWrapper
 from models.lattice_bart import LatticeBart
+from models.utils import config_layer_wise_lr, model_init
 from utils.args import *
-from utils.dataset import LatticeTextDataset, dict_to_device
 from utils.lamb import Lamb
-from utils.utils import set_seed, set_logger, LimitedQueue, EarlyStopping, model_init
+from utils.utils import set_seed, set_logger, RuntimeMetric
 
 
 def parse_args_and_setup_hyper_param() -> Namespace:
@@ -40,7 +42,6 @@ def parse_args_and_setup_hyper_param() -> Namespace:
             setattr(args, key, val.strip())
 
     config_exp_dir(args)
-    # config_cache_dir(args)
 
     set_seed(args.seed)
     set_logger(args)
@@ -48,31 +49,55 @@ def parse_args_and_setup_hyper_param() -> Namespace:
     return args
 
 
-def config_optimizer(encoder: EncoderWrapper, args: Namespace):
-    # TODO: 更好地控制每一层的学习率
+def get_encoder_and_tokenizer(args: Namespace):
+    if args.default_config is not None:
+        encoder = LatticeBart(get_model_config(args.default_config)).get_encoder()
+        tokenizer = get_tokenizer()
+    elif args.bart_path is not None:
+        encoder = LatticeBart.from_bart(bart_path=args.bart_path, depth_clip=args.depth_clip,
+                                        lat_enc_layers=args.lat_enc_layers).get_encoder()
+        tokenizer = BartTokenizer.from_pretrained(args.bart_path)
+    elif args.lat_bart_path is not None:
+        encoder = LatticeBart.from_pretrained(args.lat_bart_path).get_encoder()
+        tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
+    else:
+        logging.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
+        raise ValueError("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
+
+    encoder = EncoderWrapper(encoder)
+
+    if args.init_model:
+        logging.info("[!] Initialize model parameters.")
+        model_init(encoder, std=encoder.config.init_std, except_modules=())
+
+    # If you have multiple GPUs, why not use them?
+    if "cuda" in args.device and torch.cuda.device_count() > 1:
+        logging.info(f"Found {torch.cuda.device_count()} GPUs, using distributed training")
+        encoder = nn.DataParallel(encoder)
+
+    return encoder, tokenizer
+
+
+def config_optimizer(encoder: Union[EncoderWrapper, LatticeBart], args: Namespace):
     name = args.optim.lower()
+    param_list = config_layer_wise_lr(encoder, args.lr, args.lr_decay)
     if name == "sgd":
-        optim = torch.optim.SGD(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        optim = torch.optim.SGD(param_list, lr=args.lr, weight_decay=args.weight_decay)
     elif name == "adam":
-        optim = AdamW(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98), eps=1e-9)
+        optim = AdamW(param_list, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98), eps=1e-9)
     elif name == "lamb":
-        optim = Lamb(encoder.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98), eps=1e-9,
-                     adam=True)
+        optim = Lamb(param_list, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98), eps=1e-9, adam=True)
     else:
         logging.error(f"Unsupported optimizer called {args.optim}")
         raise ValueError(f"Unsupported optimizer called {args.optim}")
     return optim
 
 
-def save_checkpoint(epoch: int, metric, model, optimizer, tokenizer: BartTokenizer, args: Namespace):
-    """
-    Checkpoint contains:
-        + model states
-        + optimizer states
-        + other states
-    """
+def save_checkpoint(epoch: int, metric, model, optimizer, tokenizer: BartTokenizer, runtime_metric: RuntimeMetric,
+                    args: Namespace):
     exp_dir = join(args.exp_dir, f"epoch_{epoch}")
     os.makedirs(exp_dir, exist_ok=True)
+
     # Save metric
     if args.use_metric in ("loss",):
         open(join(exp_dir, f"metric_{metric:.2e}"), "w")
@@ -80,12 +105,17 @@ def save_checkpoint(epoch: int, metric, model, optimizer, tokenizer: BartTokeniz
         open(join(exp_dir, f"metric_{metric:.2%}"), "w")
     else:  # "bleu"
         open(join(exp_dir, f"metric_{metric:.2f}"), "w")
+
     # Model state and config.json
     model.save_pretrained(exp_dir)
-    # Optimizer state
+    # # Optimizer state
     torch.save(optimizer.state_dict(), join(exp_dir, "optim.pt"))
     # Tokenizer
     tokenizer.save_pretrained(args.exp_dir)
+
+    # Metric
+    runtime_metric.dump(join(exp_dir, "runtime_metric.json"))
+
     logging.info(f"Save checkpoints to {exp_dir}")
 
 
@@ -105,11 +135,11 @@ def select_best_checkpoint(exp_dir: str, use_metric: str):
             best_exp_dir = "/".join(_prefix)
         else:
             if use_metric in ("cer", "wer", "loss"):
-                if best_metric > metric:
+                if best_metric >= metric:
                     best_metric = metric
                     best_exp_dir = "/".join(_prefix)
             else:
-                if best_metric < metric:
+                if best_metric <= metric:
                     best_metric = metric
                     best_exp_dir = "/".join(_prefix)
 
@@ -177,40 +207,21 @@ def evaluate(encoder: EncoderWrapper, tokenizer: BartTokenizer, dataloader: Data
     return {"loss": avg_loss}
 
 
-def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokenizer, trainset: LatticeTextDataset,
-          devset: LatticeTextDataset, args: Namespace):
-    # Dataloader
-    collate_fn = trainset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
-    train_loader = DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.num_workers,
-                              collate_fn=collate_fn, drop_last=isinstance(encoder, nn.DataParallel))
-    dev_loader = DataLoader(devset, batch_size=args.eval_batch, shuffle=False,
-                            num_workers=args.num_workers, collate_fn=collate_fn)
-
+def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokenizer, train_loader: DataLoader,
+          dev_loader: DataLoader, optimizer, scheduler, writer: SummaryWriter, args: Namespace, epoch_trained=1,
+          runtime_metric: RuntimeMetric = None):
     # Model
     encoder.to(args.device)
 
-    # Optimizer & Scheduler
-    optimizer = config_optimizer(encoder, args)
-    total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
-    logging.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=floor(total_steps * 0.01),
-        num_training_steps=total_steps
-    )
-
     # Metrics
-    best_metrics = None
-    writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
-    avg_loss = LimitedQueue(max_len=10)
-    early_stop = EarlyStopping(patience=args.patience, decrease=(args.use_metric in ("cer", "wer", "loss")))
+    mtc = RuntimeMetric(None, window_size=10, patience=args.patience,
+                        decrease=(args.use_metric in ("cer", "wer", 'loss'))) if runtime_metric is None \
+        else runtime_metric
 
     logging.info("==== Start training ====")
 
-    for epoch in range(1, args.epoch + 1):
+    for epoch in range(epoch_trained, args.epoch + 1):
         encoder.train()
-        # trainset.window_disturb(args.train_batch * args.grad_acc_steps)
-        # trainset.shuffle()     # TAG: 直接对trainset调整似乎会出问题
 
         max_steps = len(train_loader)
         tic = time.time()
@@ -229,15 +240,17 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
             sim_mtx = cos_similarity_mtx(last_state1, last_state2)  # [B, B]
             loss = contrastive_loss(sim_mtx, reduction="mean")
             loss.backward()
-            avg_loss.append(loss.item())
+            mtc.avg_loss.append(loss.item())
 
             global_step = len(train_loader) * (epoch - 1) + step
             writer.add_scalar(tag="loss", scalar_value=loss.item(), global_step=global_step)
 
             if step % args.log_every == 0:
-                lrs = ",".join([f"{group['lr']:.2e}" for group in optimizer.param_groups])
+                lrs = [f"{group['lr']:.2e}" for group in optimizer.param_groups]
+                lrs = [lrs[0], lrs[-1]] if len(lrs) > 2 else lrs
+                lrs = " ~ ".join(lrs)
                 logging.info(f"Ep {epoch} / {args.epoch} | st {step} / {max_steps} | lr: {lrs} | "
-                             f"avg loss: {avg_loss.avg_value:.2e}")
+                             f"avg loss: {mtc.avg_loss.avg_value:.2e}")
 
             if global_step % args.grad_acc_steps == 0:
                 nn.utils.clip_grad_norm_(encoder.parameters(), args.clip)
@@ -263,17 +276,16 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
         )
         metric = metrics[args.use_metric]
 
-        if best_metrics is None or \
-                (best_metrics < metric and args.use_metric in ("bleu",)) or \
-                (best_metrics > metric and args.use_metric in ("cer", "wer", "loss")):
-            best_metrics = metric
+        if mtc.best_metrics is None or \
+                (mtc.best_metrics < metric and args.use_metric in ("bleu",)) or \
+                (mtc.best_metrics > metric and args.use_metric in ("cer", "wer", "loss")):
+            mtc.best_metrics = metric
 
-            if isinstance(encoder, nn.DataParallel):
-                save_checkpoint(epoch, metric, encoder.module, optimizer, tokenizer, args)
-            else:
-                save_checkpoint(epoch, metric, encoder, optimizer, tokenizer, args)
+            _m = encoder.module if isinstance(encoder, nn.DataParallel) else encoder
+            save_checkpoint(epoch=epoch, metric=metric, model=_m, optimizer=optimizer,
+                            tokenizer=tokenizer, runtime_metric=mtc, args=args)
 
-        if early_stop.stop(metric):
+        if mtc.early_stop.stop(metric):
             logging.info(f"Early stopping after {epoch} epoch.")
             break
 
@@ -281,63 +293,82 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
 def main():
     args = parse_args_and_setup_hyper_param()
 
+    #########################
     ######## Dataset ########
-    data_process = {
-        "lower_case": True,
-        "sort_by_len": args.sort_by_len == 1,
-        "lm_scale": args.lm_scale,
-        "ac_scale": args.ac_scale,
-        "use_marginal": args.use_marginal == 1,
-        "use_min_depth": args.use_min_depth == 1,
-        "use_max_depth": args.use_max_depth == 1,
-        "use_forward_backward": args.use_forward_backward == 1,
-        "use_lattice_mask": args.use_lattice_mask == 1,
-        "binary_mask": args.use_binary_mask == 1
-    }
+    #########################
+    process_cfg = DataProcessCfg(
+        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
+        lm_scale=args.lm_scale, use_marginal=args.use_marginal == 1, use_min_depth=args.use_min_depth == 1,
+        use_max_depth=args.use_max_depth == 1, use_forward_backward=args.use_forward_backward == 1,
+        use_lattice_mask=args.use_lattice_mask == 1, binary_mask=args.use_binary_mask == 1
+    )
 
-    if args.train_lats is None:
-        trainset = None
-    else:
-        trainset = LatticeTextDataset(lattice_pattern=args.train_lats, text_pattern=args.train_text,
-                                      cache_dir=join(args.cache_dir, "cache_train"), min_nodes=args.min_nodes,
-                                      max_nodes=args.max_nodes, **data_process)
+    trainset = devset = None
 
-    if args.eval_lats is None:
-        devset = None
-    else:
-        devset = LatticeTextDataset(lattice_pattern=args.eval_lats, text_pattern=args.eval_text,
-                                    cache_dir=join(args.cache_dir, "cache_dev"), min_nodes=0,
-                                    max_nodes=args.max_nodes, **data_process)
+    if args.train_lats is not None:
+        trainset = LatticeTextDataset(lattice_pattern=args.train_lats,
+                                      lattice_ark_pattern=args.train_lat_ark,
+                                      text_pattern=args.train_text,
+                                      cache_dir=join(args.cache_dir, "cache_train"),
+                                      process_cfg=process_cfg)
 
+    if args.eval_lats is not None:
+        devset = LatticeTextDataset(lattice_pattern=args.eval_lats,
+                                    lattice_ark_pattern=args.eval_lat_ark,
+                                    text_pattern=args.eval_text,
+                                    cache_dir=join(args.cache_dir, "cache_dev"),
+                                    process_cfg=process_cfg)
+
+    #######################
     ######## Train ########
-    # If no train or eval data, the training process will be passed
+    #######################
     if trainset is None or len(trainset) == 0 or devset is None or len(devset) == 0:
         logging.info("No valid training data. Training phase is passed.")
     else:
-        if args.bart_path is not None:
-            encoder = LatticeBart.from_bart(bart_path=args.bart_path, depth_clip=args.depth_clip,
-                                            lat_enc_layers=args.lat_enc_layers).get_encoder()
-            tokenizer = BartTokenizer.from_pretrained(args.bart_path)
-        elif args.lat_bart_path is not None:
-            encoder = LatticeBart.from_pretrained(args.lat_bart_path).get_encoder()
-            tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
-        else:
-            logging.error("One of --bart_path and --lat_bart_path should be set")
-            raise ValueError("One of --bart_path and --lat_bart_path should be set")
+        encoder, tokenizer = get_encoder_and_tokenizer(args)
 
-        encoder = EncoderWrapper(encoder)
+        collate_fn = trainset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
+        train_loader = DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.num_workers,
+                                  collate_fn=collate_fn, drop_last=isinstance(encoder, nn.DataParallel))
+        dev_loader = DataLoader(devset, batch_size=args.eval_batch, shuffle=False,
+                                num_workers=args.num_workers, collate_fn=collate_fn)
 
-        if args.init_model:
-            logging.info("[!] Initialize model parameters. Except Embedding")
-            model_init(encoder, std=encoder.config.init_std, except_modules=())
+        optimizer = config_optimizer(encoder, args)
+        total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
+        logging.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=floor(total_steps * 0.01),
+            num_training_steps=total_steps
+        )
 
-        # If you have multiple GPUs, why not use them?
-        if "cuda" in args.device and torch.cuda.device_count() > 1:
-            logging.info(f"Found {torch.cuda.device_count()} GPUs, using distributed training")
-            encoder = nn.DataParallel(encoder)
+        mtc = RuntimeMetric(None, window_size=10, patience=args.patience,
+                            decrease=(args.use_metric in ("cer", "wer", "loss")))
+        epoch_trained = 1
+        writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
+
+        ####################
+        ### Fast Forward ###
+        ####################
+        if args.checkpoint:
+            epoch_trained = int(dirname(args.checkpoint).split("_")[-1])
+            step_trained = ceil(epoch_trained * len(trainset) / (args.train_batch * args.grad_acc_steps))
+
+            optimizer.load_state_dict(torch.load(join(args.checkpoint, "optim.pt")))
+
+            for i in range(step_trained):
+                scheduler.step()
+
+            for i in range(epoch_trained):
+                for _ in train_loader:
+                    break
+
+            mtc = RuntimeMetric.load(join(args.checkpoint, "runtime_metric.json"))
 
         try:
-            train(encoder, tokenizer, trainset, devset, args)
+            train(encoder=encoder, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader,
+                  optimizer=optimizer, scheduler=scheduler, writer=writer, args=args, epoch_trained=epoch_trained,
+                  runtime_metric=mtc)
         except KeyboardInterrupt:
             logging.info("Interrupt by user.")
 
@@ -347,6 +378,13 @@ def main():
     if exp_dir is None:
         logging.warning("No checkpoints found.")
     else:
+        if len(args.test_lats) == 0 and len(args.test_lat_ark) == 0:
+            logging.error("No test data found.")
+            return
+        if len(args.test_lats) > 0 and len(args.test_lat_ark) > 0:
+            logging.error(f"Only one `--test_lats` and `--test_lat_ark` of can be set. "
+                          f"Got: test_lats: {args.test_lats}, test_lat_ark: {args.test_lat_ark}")
+            return
         try:
             encoder = EncoderWrapper.from_pretrained(exp_dir).to(args.device).eval()
             tokenizer = BartTokenizer.from_pretrained(args.exp_dir)
@@ -355,20 +393,20 @@ def main():
                 logging.info(f"Found {torch.cuda.device_count()} GPUs, using distributed testing")
                 encoder = nn.DataParallel(encoder)
 
-            # if args.test_lats is None:
-            #     logging.warning("No test data found.")
-            #     return
+            logging.info("==== Start testing ====")
 
             cache_test = join(args.cache_dir, "cache_test")
-            testset = LatticeTextDataset(lattice_pattern=args.test_lats, text_pattern=args.test_text,
-                                         cache_dir=cache_test, min_nodes=0, max_nodes=args.max_nodes,
-                                         **data_process)
-            collate_fn = testset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
-            test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,
-                                     num_workers=args.num_workers, collate_fn=collate_fn)
+            test_lats = [None] * len(args.test_lat_ark) if len(args.test_lats) == 0 else args.test_lats
+            test_lat_ark = [None] * len(args.test_lats) if len(args.test_lat_ark) == 0 else args.test_lat_ark
 
-            logging.info("==== Start testing ====")
-            evaluate(encoder, tokenizer, test_loader, args)
+            for _lats, _lat_ark in zip(test_lats, test_lat_ark):
+                testset = LatticeTextDataset(lattice_pattern=_lats, lattice_ark_pattern=_lat_ark,
+                                             text_pattern=args.test_text, cache_dir=cache_test, process_cfg=process_cfg)
+                collate_fn = testset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
+                test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,
+                                         num_workers=args.num_workers, collate_fn=collate_fn)
+
+                evaluate(encoder=encoder, tokenizer=tokenizer, dataloader=test_loader, args=args)
 
         except FileNotFoundError:
             logging.error("FileNotFoundError!")

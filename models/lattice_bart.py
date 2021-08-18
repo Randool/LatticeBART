@@ -183,7 +183,7 @@ class LatticeBart(BartPretrainedModel):
         return lattice_bart
 
     @classmethod
-    def from_bart(cls, bart_path: str, depth_clip=200, lat_enc_layers=3):
+    def from_bart(cls, bart_path: str, depth_clip: int, lat_enc_layers: int):
         bart = BartForConditionalGeneration.from_pretrained(bart_path)
         config = bart.config.to_dict()
         config["depth_clip"] = depth_clip

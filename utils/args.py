@@ -8,19 +8,25 @@ import torch
 
 def add_args_for_model_construct(parser: ArgumentParser):
     p = parser.add_argument_group("Model construct")
+    p.add_argument("--default_config", type=str, choices=("tiny", "base", "large"), help="Select configurations")
+
     p.add_argument("--depth_clip", type=int, default=200, help="Lattice depth clip")
-    p.add_argument("--bart_path", type=str, help="Pretrained Bart path")
-    p.add_argument("--lat_bart_path", type=str, help="Pretrained LatticeBart path")
     p.add_argument("--lat_enc_layers", type=int, default=1, help="LatticeEncoder layers")
-    p.add_argument("--lat_encoder", type=str, help="Pretrained LatticeEncoder path")
+
+    p.add_argument("--bart_path", type=str, help="Pretrained Bart path")
     p.add_argument("--init_model", type=int, choices=(0, 1), default=0, help="Init all model's parameters")
+
+    p.add_argument("--lat_bart_path", type=str, help="Pretrained LatticeBart path")
+    p.add_argument("--lat_encoder", type=str, help="Pretrained LatticeEncoder path")
+
+    p.add_argument("--checkpoint", type=str, help="checkpoint, epoch_n")
 
 
 def add_args_for_lr(parser: ArgumentParser):
     p = parser.add_argument_group("Lr params")
     p.add_argument("--lr", type=float, default=1e-5, help="Learning rate for pretrained parts")
     p.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
-    p.add_argument("--layer_lr_decay", type=float, default=0.9, help="Layer-wise lr decay")
+    p.add_argument("--lr_decay", type=float, default=1.0, help="Layer-wise lr decay")
     p.add_argument("--grad_acc_steps", type=int, default=1, help="Steps to accumulate grad")
     p.add_argument("--clip", type=float, default=1, help="Gradient clip")
 
@@ -31,7 +37,11 @@ def add_args_for_data_path(parser: ArgumentParser):
 
     p.add_argument("--train_lats", type=str, help="/path/to/lattice")
     p.add_argument("--eval_lats", type=str, help="/path/to/lattice")
-    p.add_argument("--test_lats", type=str, help="/path/to/lattice")
+    p.add_argument("--test_lats", type=str, nargs="*", default=[], help="/path/to/lattice")
+
+    p.add_argument("--train_lat_ark", type=str, help="/path/to/lattice ark file")
+    p.add_argument("--eval_lat_ark", type=str, help="/path/to/lattice ark file")
+    p.add_argument("--test_lat_ark", type=str, nargs="*", default=[], help="/path/to/lattice ark file")
 
     p.add_argument("--train_text", type=str, help="/path/to/text")
     p.add_argument("--eval_text", type=str, help="/path/to/text")

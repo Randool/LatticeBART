@@ -1,4 +1,4 @@
-from transformers import BartConfig
+from transformers import BartConfig, BartTokenizer
 
 
 class LatticeBartConfig(BartConfig):
@@ -10,16 +10,16 @@ class LatticeBartConfig(BartConfig):
             vocab_size=50265,
             max_position_embeddings=1024,
             encoder_layers=6,
-            lat_enc_layers=3,
-            encoder_ffn_dim=4096,
-            encoder_attention_heads=16,
+            lat_enc_layers=6,
+            encoder_ffn_dim=3072,
+            encoder_attention_heads=12,
             decoder_layers=6,
-            decoder_ffn_dim=4096,
-            decoder_attention_heads=16,
+            decoder_ffn_dim=3072,
+            decoder_attention_heads=12,
             encoder_layerdrop=0.0,
             decoder_layerdrop=0.0,
             activation_function="gelu",
-            d_model=1024,
+            d_model=768,
             dropout=0.1,
             attention_dropout=0.0,
             activation_dropout=0.0,
@@ -82,3 +82,30 @@ class LatticeBartConfig(BartConfig):
     @property
     def hidden_size(self) -> int:
         return self.d_model
+
+
+def tiny_model_config():
+    return LatticeBartConfig.from_json_file("./models/configs/tiny/config.json")
+
+
+def base_model_config():
+    return LatticeBartConfig.from_json_file("./models/configs/base/config.json")
+
+
+def large_model_config():
+    return LatticeBartConfig.from_json_file("./models/configs/large/config.json")
+
+
+def get_model_config(_type: str):
+    if _type == "tiny":
+        return tiny_model_config()
+    elif _type == "base":
+        return base_model_config()
+    elif _type == "large":
+        return large_model_config()
+    else:
+        raise ValueError(f"Unrecognized type: {_type}")
+
+
+def get_tokenizer():
+    return BartTokenizer.from_pretrained("./models/configs/base")

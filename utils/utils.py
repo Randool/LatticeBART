@@ -1,13 +1,14 @@
+import json
 import logging
 import os
 import random
 from argparse import Namespace
+from collections import namedtuple
 from os.path import join
-from typing import Union
+from typing import List
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 
 def set_seed(seed):
@@ -26,15 +27,30 @@ def set_logger(args: Namespace):
     logging.info("=" * 30)
 
 
-class LimitedQueue(list):
-    def __init__(self, max_len: int = -1):
-        super().__init__()
+class LimitedQueue:
+    def __init__(self, max_len: int = -1, items: List[float] = None):
         self.max_len = max_len
+        self.items: List[float] = [] if items is None else items
 
     def append(self, item: float):
-        if self.max_len != -1 and len(self) >= self.max_len:
+        while self.max_len != -1 and len(self) >= self.max_len:
             self.pop(0)
-        super().append(item)
+        self.items.append(item)
+
+    def pop(self, index=-1):
+        return self.items.pop(index)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __iter__(self):
+        yield from self.items
+
+    def __str__(self):
+        return str(self.items)
+
+    def __repr__(self):
+        return str(self.items)
 
     @property
     def is_full(self):
@@ -44,11 +60,11 @@ class LimitedQueue(list):
     def avg_value(self):
         if len(self) == 0:
             return 0
-        return sum(self) / len(self)
+        return sum(self.items) / len(self)
 
 
 class EarlyStopping:
-    def __init__(self, patience: int, decrease=True):
+    def __init__(self, patience: int = 1, decrease=True):
         self.metrics = LimitedQueue(patience)
         self.decrease = decrease
 
@@ -62,25 +78,41 @@ class EarlyStopping:
         else:
             satisfy = any([metric > x for x in self.metrics])
         self.metrics.append(metric)
+
         return not satisfy
 
     def __repr__(self):
         return f"EarlyStopping<decrease={self.decrease},{repr(self.metrics)}>"
 
 
-def model_init(model: nn.Module, std: float, except_modules: Union[list, tuple] = ()):
-    # Init function
-    def _init_weights(m):
-        if m in except_modules:
-            logging.debug(f"Module ({m}) gets rid of initialization")
-            return
-        if isinstance(m, nn.Linear):
-            m.weight.data.normal_(mean=0.0, std=std)
-            if m.bias is not None:
-                m.bias.data.zero_()
-        elif isinstance(m, nn.Embedding):
-            m.weight.data.normal_(mean=0.0, std=std)
-            if m.padding_idx is not None:
-                m.weight.data[m.padding_idx].zero_()
+class RuntimeMetric:
+    def __init__(self, best_metrics=None, window_size=10, patience=1, decrease=True):
+        self.best_metrics = best_metrics
+        self.avg_loss = LimitedQueue(window_size)
+        self.early_stop = EarlyStopping(patience, decrease)
 
-    model.apply(_init_weights)
+    def dump(self, filename: str):
+        tmp = {
+            "best_metrics": self.best_metrics,
+            "window_size": self.avg_loss.max_len,
+            "patience": self.early_stop.metrics.max_len,
+            "decrease": self.early_stop.decrease,
+            "avg_loss.items": self.avg_loss.items,
+            "early_stop.metrics.items": self.early_stop.metrics.items
+        }
+        with open(filename, "w", encoding="utf8") as f:
+            json.dump(tmp, f, indent=1)
+
+    @classmethod
+    def load(cls, filename: str):
+        with open(filename, encoding="utf8") as f:
+            tmp = json.load(f)
+            avg_loss_items = tmp.pop("avg_loss.items")
+            early_stop_metrics_items = tmp.pop("early_stop.metrics.items")
+        ins = cls(**tmp)
+        ins.avg_loss.items = avg_loss_items
+        ins.early_stop.metrics.items = early_stop_metrics_items
+        return ins
+
+
+StatePack = namedtuple("StatePack", ("epoch", "runtime_metric", "optimizer", "scheduler", "train_loader", "writer"))
