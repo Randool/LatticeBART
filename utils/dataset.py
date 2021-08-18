@@ -1,12 +1,12 @@
 import glob
 import gzip
 import logging
+import os
 import pickle
 import random
 import sys
 from collections import namedtuple
-from itertools import count
-from os.path import exists
+from os.path import exists, join, split
 from typing import Union, Tuple, Dict, Any, List
 
 import networkx as nx
@@ -245,46 +245,15 @@ def line_graph_process(L: nx.DiGraph, use_marginal=True, min_depth=True, max_dep
     return LAT_INFO(" ".join(words), marginals, _min_depth, _max_depth, fb_mtx, lattice_mask)
 
 
-_items_per_cache = 100000  # The number of pairs per cache file
+def _load_cache(cache_file: str):
+    with open(cache_file, "rb") as f:
+        _data = pickle.load(f)
+    return _data
 
 
-def _load_cache(cache_prefix: str):
-    if (cache_prefix is not None) and exists(cache_prefix + ".OK"):
-        data = None
-        for cache_file in sorted(glob.glob(cache_prefix + f'.*.pkl')):
-            with open(cache_file, "rb") as f:
-                _data = pickle.load(f)
-            if data is None:
-                data = type(_data)()
-                logging.info(f"Cache format is {type(_data)}")
-            if isinstance(_data, list):
-                data.extend(_data)
-            elif isinstance(_data, (set, dict)):
-                data.update(_data)
-            logging.info(f"Read cache from '{cache_file}'")
-        return data
-    return None
-
-
-def _dump_cache(cache_prefix: str, data, items_per_cache):
-    raw_type = type(data)
-    if isinstance(data, list):
-        data_items = data
-    elif isinstance(data, set):
-        data_items = list(data)
-    elif isinstance(data, dict):
-        data_items = list(data.items())
-    else:
-        raise ValueError(f"Unrecognized data type {type(data)}")
-
-    for idx, i in zip(count(0, 1), range(0, len(data), items_per_cache)):
-        cache_file = cache_prefix + f".{idx:03d}.pkl"
-        with open(cache_file, "wb") as f:
-            pickle.dump(raw_type(data_items[i: i + items_per_cache]), f)
-        logging.info(f"Cache data pairs to {cache_file}")
-
-    open(cache_prefix + ".OK", "w")
-    logging.info(f"Cache finished. Flag file '{cache_prefix}.OK' is saved.")
+def _cache_data(data, cache_file: str):
+    with open(cache_file, "wb") as f:
+        pickle.dump(data, f)
 
 
 class _KeyBased:
@@ -303,44 +272,52 @@ class _KeyBased:
 class _LatticeDataset(_KeyBased):
     """ Dataset to parse only kaldi's compact lattice files """
 
-    def __init__(self, lattice_file_pattern: str, cache_prefix: str = None, min_nodes: int = 0,
+    def __init__(self, lattice_file_pattern: str, cache_dir: str = None, min_nodes: int = 0,
                  max_nodes: int = MAX_NODEs, lower_case=True, lm_scale=1.0, ac_scale=1.0):
-        # Try to read cache first
-        if cache_prefix is not None:
-            items = _load_cache(cache_prefix)
-            if items is not None:
-                self.items = items
-                return
-
         self.items = {}  # type: Dict[str, List[nx.DiGraph]]
 
-        # Read data
-        files = sorted(glob.glob(lattice_file_pattern))
-        if len(files) == 0:
-            raise FileNotFoundError("No lattice files found")
+        if cache_dir is None:
+            cache_dir = None
+        else:
+            key = f"min_{min_nodes},max_{max_nodes},low_{lower_case},lm_{lm_scale:.2e},ac_{ac_scale:.2e}"
+            cache_dir = join(cache_dir, key)
+            os.makedirs(cache_dir, exist_ok=True)
 
-        total_cnt = _EPS
-        for file in files:
-            _lattices = parse_lattice_file(file, to_line_graph=True, lower_case=lower_case,
-                                           lm_scale=lm_scale, ac_scale=ac_scale)
-            total_cnt += len(_lattices)
-            logging.info(f"Load {len(_lattices)} lattices from {file}.")
-
-            for lattice_id, lat in _lattices.items():
-                if len(lat) < min_nodes or len(lat) > max_nodes:
-                    continue
-                if lattice_id in self.items:
-                    self.items[lattice_id].append(lat)
+        for file in sorted(glob.glob(lattice_file_pattern)):
+            if cache_dir is not None:
+                filename = join(cache_dir, f"{split(file)[-1]}.cache")
+                if exists(filename):
+                    _lattices = _load_cache(filename)
+                    logging.info(f"Load {len(_lattices)} lattices from {filename}.")
                 else:
-                    self.items[lattice_id] = [lat]
+                    _lattices = self._load_and_filter(file, min_nodes, max_nodes, lower_case, lm_scale, ac_scale)
+                    _cache_data(_lattices, filename)
+                    logging.info(f"Cache {len(_lattices)} lattices to {filename}.")
+            else:
+                _lattices = self._load_and_filter(file, min_nodes, max_nodes, lower_case, lm_scale, ac_scale)
 
-        delta = total_cnt - len(self.items)
-        logging.info(f"{self.__class__.__name__}: {len(self.items)} items. "
-                     f"{delta} ({delta / total_cnt:.2%}) items filtered")
+            for lat_id, lat in _lattices.items():
+                if lat_id in self.items:
+                    self.items[lat_id].append(lat)
+                else:
+                    self.items[lat_id] = [lat]
 
-        # Cache data
-        if cache_prefix is not None:
-            _dump_cache(cache_prefix, self.items, _items_per_cache)
+        # Read data
+        if len(self.items) == 0:
+            raise RuntimeError("No lattice files found")
+
+        logging.info(f"{self.__class__.__name__}: {len(self.items)} items.")
+
+    @staticmethod
+    def _load_and_filter(file: str, min_nodes: int, max_nodes: int, lower_case: bool, lm_scale: float, ac_scale: float):
+        # Do data process
+        _lattices = parse_lattice_file(file, to_line_graph=True, lower_case=lower_case,
+                                       lm_scale=lm_scale, ac_scale=ac_scale)
+        for lattice_id, lat in list(_lattices.items()):
+            if len(lat) < min_nodes or len(lat) > max_nodes:
+                del _lattices[lattice_id]
+        logging.info(f"Load {len(_lattices)} lattices from {file}.")
+        return _lattices
 
 
 class __TextDataset(_KeyBased):
@@ -391,7 +368,7 @@ class _TextDataset(__TextDataset):
 
 class LatticeTextDataset(Dataset):
     def __init__(
-            self, lattice_pattern: str, text_pattern: str = None, cache_prefix: str = None,
+            self, lattice_pattern: str, text_pattern: str = None, cache_dir: str = None,
             min_nodes=0, max_nodes=MAX_NODEs, lower_case=True, lm_scale=1.0, ac_scale=1.0,
             use_marginal=True, use_min_depth=True, use_max_depth=True, use_forward_backward=True,
             use_lattice_mask=True, binary_mask=True, sort_by_len=True
@@ -409,7 +386,7 @@ class LatticeTextDataset(Dataset):
         self.use_lattice_mask = use_lattice_mask
         self.binary_mask = binary_mask
 
-        lattices = _LatticeDataset(lattice_pattern, cache_prefix=cache_prefix, min_nodes=min_nodes, max_nodes=max_nodes,
+        lattices = _LatticeDataset(lattice_pattern, cache_dir=cache_dir, min_nodes=min_nodes, max_nodes=max_nodes,
                                    lower_case=lower_case, lm_scale=lm_scale, ac_scale=ac_scale)
         keys = set(lattices.keys())
 
@@ -422,6 +399,8 @@ class LatticeTextDataset(Dataset):
 
         if sort_by_len:
             self.sort_by_length()
+
+        logging.info(f"{self.__class__.__name__}: {len(self)} items.")
 
     def __len__(self):
         return len(self.items)

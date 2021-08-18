@@ -11,8 +11,8 @@ def add_args_for_model_construct(parser: ArgumentParser):
     p.add_argument("--depth_clip", type=int, default=200, help="Lattice depth clip")
     p.add_argument("--bart_path", type=str, help="Pretrained Bart path")
     p.add_argument("--lat_bart_path", type=str, help="Pretrained LatticeBart path")
-    p.add_argument("--lat_encoder_pt", type=str, help="Pretrained LatticeEncoder state_dict pt")
-    # p.add_argument("--init_model", action="store_true", help="Init all model's parameters")
+    p.add_argument("--lat_enc_layers", type=int, default=1, help="LatticeEncoder layers")
+    p.add_argument("--lat_encoder", type=str, help="Pretrained LatticeEncoder path")
     p.add_argument("--init_model", type=int, choices=(0, 1), default=0, help="Init all model's parameters")
 
 
@@ -20,7 +20,7 @@ def add_args_for_lr(parser: ArgumentParser):
     p = parser.add_argument_group("Lr params")
     p.add_argument("--lr", type=float, default=1e-5, help="Learning rate for pretrained parts")
     p.add_argument("--weight_decay", type=float, default=1e-5, help="Weight decay")
-    p.add_argument("--layer_lr_decay", type=float, default=0.985, help="Layer-wise lr decay")
+    p.add_argument("--layer_lr_decay", type=float, default=0.9, help="Layer-wise lr decay")
     p.add_argument("--grad_acc_steps", type=int, default=1, help="Steps to accumulate grad")
     p.add_argument("--clip", type=float, default=1, help="Gradient clip")
 
@@ -116,14 +116,14 @@ def config_exp_dir(args: Namespace):
         if getattr(args, name, None) is not None:
             parts.append(f"{name}-{getattr(args, name)}")
 
-    if getattr(args, "lat_encoder_pt", None) is not None:
-        method = re.findall("(" + "|".join(CHOICE) + ")", getattr(args, "lat_encoder_pt"))
+    if getattr(args, "lat_encoder", "") != "":
+        method = re.findall("(" + "|".join(CHOICE) + ")", getattr(args, "lat_encoder"))
         if len(method) == 1:
             method = method[0]
         elif len(method) == 0:
-            raise ValueError(f"Can not find any choices ({CHOICE}) in `lat_encoder_pt`")
+            raise ValueError(f"Can not find any choices ({CHOICE}) in `lat_encoder`")
         else:
-            raise ValueError(f"Multiple choices on `{CHOICE}` in `lat_encoder_pt`")
+            raise ValueError(f"Multiple choices on `{CHOICE}` in `lat_encoder`")
         parts.append(f"method-{method}")
 
     if "cuda" in args.device and torch.cuda.device_count() > 1:

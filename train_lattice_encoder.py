@@ -15,7 +15,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import BartTokenizer, AdamW, get_cosine_schedule_with_warmup
 
-from models.lattice_bart import LatticeBart, EncoderWrapper
+from models.encoder import EncoderWrapper
+from models.lattice_bart import LatticeBart
 from utils.args import *
 from utils.dataset import LatticeTextDataset, dict_to_device
 from utils.lamb import Lamb
@@ -39,7 +40,7 @@ def parse_args_and_setup_hyper_param() -> Namespace:
             setattr(args, key, val.strip())
 
     config_exp_dir(args)
-    config_cache_dir(args)
+    # config_cache_dir(args)
 
     set_seed(args.seed)
     set_logger(args)
@@ -88,8 +89,8 @@ def save_checkpoint(epoch: int, metric, model, optimizer, tokenizer: BartTokeniz
     logging.info(f"Save checkpoints to {exp_dir}")
 
 
-def select_best_checkpoint(args: Namespace):
-    metrics = glob.glob(join(args.exp_dir, "epoch_*", "metric_*"))
+def select_best_checkpoint(exp_dir: str, use_metric: str):
+    metrics = glob.glob(join(exp_dir, "epoch_*", "metric_*"))
     if len(metrics) == 0:
         return None
 
@@ -103,7 +104,7 @@ def select_best_checkpoint(args: Namespace):
             best_metric = metric
             best_exp_dir = "/".join(_prefix)
         else:
-            if args.use_metric in ("cer", "wer", "loss"):
+            if use_metric in ("cer", "wer", "loss"):
                 if best_metric > metric:
                     best_metric = metric
                     best_exp_dir = "/".join(_prefix)
@@ -220,7 +221,7 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
             if args.contrast_method == "dropout":
                 last_state1 = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
                 last_state2 = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
-            else:   # mask
+            else:  # mask
                 last_state = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
                 last_state1 = last_state[::2]
                 last_state2 = last_state[1::2]
@@ -298,14 +299,14 @@ def main():
         trainset = None
     else:
         trainset = LatticeTextDataset(lattice_pattern=args.train_lats, text_pattern=args.train_text,
-                                      cache_prefix=join(args.cache_dir, "cache_train"), min_nodes=args.min_nodes,
+                                      cache_dir=join(args.cache_dir, "cache_train"), min_nodes=args.min_nodes,
                                       max_nodes=args.max_nodes, **data_process)
 
     if args.eval_lats is None:
         devset = None
     else:
         devset = LatticeTextDataset(lattice_pattern=args.eval_lats, text_pattern=args.eval_text,
-                                    cache_prefix=join(args.cache_dir, "cache_dev"), min_nodes=0,
+                                    cache_dir=join(args.cache_dir, "cache_dev"), min_nodes=0,
                                     max_nodes=args.max_nodes, **data_process)
 
     ######## Train ########
@@ -314,7 +315,8 @@ def main():
         logging.info("No valid training data. Training phase is passed.")
     else:
         if args.bart_path is not None:
-            encoder = LatticeBart.from_bart(args.bart_path, args.depth_clip).get_encoder()
+            encoder = LatticeBart.from_bart(bart_path=args.bart_path, depth_clip=args.depth_clip,
+                                            lat_enc_layers=args.lat_enc_layers).get_encoder()
             tokenizer = BartTokenizer.from_pretrained(args.bart_path)
         elif args.lat_bart_path is not None:
             encoder = LatticeBart.from_pretrained(args.lat_bart_path).get_encoder()
@@ -341,7 +343,7 @@ def main():
 
     ######## Test ########
     # Gather metrics
-    exp_dir = select_best_checkpoint(args)
+    exp_dir = select_best_checkpoint(args.exp_dir, args.use_metric)
     if exp_dir is None:
         logging.warning("No checkpoints found.")
     else:
@@ -359,7 +361,7 @@ def main():
 
             cache_test = join(args.cache_dir, "cache_test")
             testset = LatticeTextDataset(lattice_pattern=args.test_lats, text_pattern=args.test_text,
-                                         cache_prefix=cache_test, min_nodes=0, max_nodes=args.max_nodes,
+                                         cache_dir=cache_test, min_nodes=0, max_nodes=args.max_nodes,
                                          **data_process)
             collate_fn = testset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
             test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,

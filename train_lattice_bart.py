@@ -14,6 +14,7 @@ from torch.utils.data.dataloader import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AdamW, BartTokenizer, get_cosine_schedule_with_warmup
 
+from models.encoder import LatticeEncoder
 from models.lattice_bart import LatticeBart
 from train_lattice_encoder import save_checkpoint, select_best_checkpoint, cos_similarity_mtx, contrastive_loss
 from utils.args import *
@@ -41,7 +42,7 @@ def parse_args_and_setup_hyper_param() -> Namespace:
             setattr(args, key, val.strip())
 
     config_exp_dir(args)
-    config_cache_dir(args)
+    # config_cache_dir(args)
 
     set_seed(args.seed)
     set_logger(args)
@@ -275,7 +276,7 @@ def main():
     else:
         cache_train = join(args.cache_dir, "cache_train")
         trainset = LatticeTextDataset(lattice_pattern=args.train_lats, text_pattern=args.train_text,
-                                      cache_prefix=cache_train, min_nodes=args.min_nodes,
+                                      cache_dir=cache_train, min_nodes=args.min_nodes,
                                       max_nodes=args.max_nodes, **data_process)
 
     if (args.eval_lats is None) or (args.eval_text is None):
@@ -283,7 +284,7 @@ def main():
     else:
         cache_dev = join(args.cache_dir, "cache_dev")
         devset = LatticeTextDataset(lattice_pattern=args.eval_lats, text_pattern=args.eval_text,
-                                    cache_prefix=cache_dev, min_nodes=0, max_nodes=args.max_nodes,
+                                    cache_dir=cache_dev, min_nodes=0, max_nodes=args.max_nodes,
                                     **data_process)
 
     ######## Train ########
@@ -292,7 +293,9 @@ def main():
         logging.info("No valid training data. Training phase is passed.")
     else:
         if args.bart_path is not None:
-            model = LatticeBart.from_bart(args.bart_path, args.depth_clip)
+            model = LatticeBart.from_bart(
+                bart_path=args.bart_path, depth_clip=args.depth_clip, lat_enc_layers=args.lat_enc_layers
+            )
             tokenizer = BartTokenizer.from_pretrained(args.bart_path)
         elif args.lat_bart_path is not None:
             model = LatticeBart.from_pretrained(args.lat_bart_path)
@@ -305,9 +308,13 @@ def main():
             logging.info("[!] Initialize model parameters. Except Embedding")
             model_init(model, std=model.config.init_std, except_modules=(model.get_encoder().embed_tokens,))
 
-        if getattr(args, "lat_encoder_pt", "") != "":
-            model.get_encoder().load_state_dict(torch.load(args.lat_encoder_pt, map_location=lambda st, loc: st))
-            logging.info(f"Load pretrained LatticeEncoder from '{args.lat_encoder_pt}'")
+        if getattr(args, "lat_encoder", "") != "":
+            # model.get_encoder().load_state_dict(torch.load(args.lat_encoder_pt, map_location=lambda st, loc: st))
+            best_ckpt = select_best_checkpoint(args.lat_encoder, "loss")
+            model.get_encoder().load_state_dict(
+                torch.load(join(best_ckpt, LatticeEncoder.MODEL_PT), map_location=lambda st, loc: st)
+            )
+            logging.info(f"Load pretrained LatticeEncoder from '{best_ckpt}'")
 
         # If you have multiple GPUs, why not use them?
         if "cuda" in args.device and torch.cuda.device_count() > 1:
@@ -320,7 +327,7 @@ def main():
             logging.info("Interrupt by user.")
 
     ######## Test ########
-    exp_dir = select_best_checkpoint(args)
+    exp_dir = select_best_checkpoint(args.exp_dir, args.use_metric)
     if exp_dir is None:
         logging.warning("No checkpoints found.")
     else:
@@ -339,7 +346,7 @@ def main():
 
             cache_test = join(args.cache_dir, "cache_test")
             testset = LatticeTextDataset(lattice_pattern=args.test_lats, text_pattern=args.test_text,
-                                         cache_prefix=cache_test, min_nodes=0, max_nodes=args.max_nodes,
+                                         cache_dir=cache_test, min_nodes=0, max_nodes=args.max_nodes,
                                          **data_process)
             collate_fn = testset.partial_collate_fn(tokenizer)
             test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,
