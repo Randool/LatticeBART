@@ -316,12 +316,35 @@ class EncoderWrapper(nn.Module):
     def config(self):
         return self.encoder.config
 
-    def forward(self, *args, eos_id=2, **kwargs):
+    def forward(self, *args, eos_id=2, pooling_method="mean", token_id_weight: dict = None, **kwargs):
+        assert pooling_method in ("mean", "weight", "eos"), \
+            f"pooling_method({pooling_method}) should be 'mean' or 'weight' or 'eos'."
+        assert pooling_method != "weight" or (pooling_method == "weight" and token_id_weight is not None), \
+            f"When pooling_method is 'weight', token_id_weight should be given."
+
         if "output_hidden_states" not in kwargs or not kwargs["output_hidden_states"]:
             kwargs["output_hidden_states"] = True
         outputs = self.encoder.forward(*args, **kwargs)
         eos_position = torch.where(kwargs["input_ids"].eq(eos_id))
-        last_state = outputs.last_hidden_state[eos_position]
+
+        if pooling_method == "eos":
+            last_state = outputs.last_hidden_state[eos_position]
+        else:
+            hidden_states = outputs.last_hidden_state
+            B, S, _D = hidden_states.shape
+            wt = torch.ones(B, S, dtype=hidden_states.dtype, device=hidden_states.device)
+            input_ids = args[0] if len(args) > 0 else kwargs["input_ids"]
+
+            for b, eos_pos in zip(*eos_position):
+                wt[b, eos_pos + 1:] = 0
+                # Assign token weight to each position
+                if pooling_method == "weight":
+                    for i in range(eos_pos+1):
+                        wt[b, i] = token_id_weight[input_ids[b, i].item()]
+
+            last_state = (hidden_states * wt.unsqueeze(dim=-1)).sum(dim=-2)
+            last_state = last_state / wt.sum(dim=-1).unsqueeze(dim=-1)
+
         last_state = self.proj(last_state)
         return last_state
 

@@ -76,7 +76,7 @@ def get_model_and_tokenizer(args: Namespace):
             logging.info("[!] Initialize model parameters.")
             model_init(model, std=model.config.init_std, except_modules=(model.get_encoder().embed_tokens,))
 
-        if getattr(args, "lat_encoder", "") != "":
+        if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
             best_ckpt = select_best_checkpoint(args.lat_encoder, "loss")
             model.get_encoder().load_state_dict(
                 torch.load(join(best_ckpt, LatticeEncoder.MODEL_PT), map_location=lambda st, loc: st)
@@ -272,9 +272,9 @@ def main():
     #########################
     process_cfg = DataProcessCfg(
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
-        lm_scale=args.lm_scale, use_marginal=args.use_marginal == 1, use_min_depth=args.use_min_depth == 1,
-        use_max_depth=args.use_max_depth == 1, use_forward_backward=args.use_forward_backward == 1,
-        use_lattice_mask=args.use_lattice_mask == 1, binary_mask=args.use_binary_mask == 1
+        lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
+        use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
+        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask
     )
 
     trainset = devset = None
@@ -294,8 +294,10 @@ def main():
     #######################
     ######## Train ########
     #######################
-    if trainset is None or len(trainset) == 0 or devset is None or len(devset) == 0:
+    if trainset is None or len(trainset) == 0:
         logging.info("No valid training data. Training phase is passed.")
+    elif devset is None or len(devset) == 0:
+        logging.info("No valid validation data. Training phase is passed.")
     else:
         model, tokenizer = get_model_and_tokenizer(args)
 

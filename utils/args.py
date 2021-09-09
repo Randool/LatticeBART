@@ -58,12 +58,12 @@ def add_args_for_data_process(parser: ArgumentParser):
     p.add_argument("--min_nodes", type=int, default=0)
     p.add_argument("--max_nodes", type=int, default=256)
 
-    p.add_argument("--use_marginal", type=int, choices=(0, 1), default=1)
-    p.add_argument("--use_min_depth", type=int, choices=(0, 1), default=1)
-    p.add_argument("--use_max_depth", type=int, choices=(0, 1), default=1)
-    p.add_argument("--use_forward_backward", type=int, choices=(0, 1), default=1)
-    p.add_argument("--use_lattice_mask", type=int, choices=(0, 1), default=1)
-    p.add_argument("--use_binary_mask", type=int, choices=(0, 1), default=1)
+    p.add_argument("--use_marginal", type=float, default=1.0, help="Prob. of using marginal scores")
+    p.add_argument("--use_min_depth", type=float, default=1.0, help="Prob. of using min depths")
+    p.add_argument("--use_max_depth", type=float, default=1.0, help="Prob. of using max depths")
+    p.add_argument("--use_forward_backward", type=float, default=1.0, help="Prob. of using forward-backward scores")
+    p.add_argument("--use_lattice_mask", type=float, default=1.0, help="Prob. of using lattice mask")
+    p.add_argument("--use_binary_mask", type=float, default=1.0, help="Prob. of using binary mask")
 
 
 def add_args_for_train_procedure(parser: ArgumentParser):
@@ -89,6 +89,8 @@ CHOICE = ("dropout", "mask",)
 def add_args_for_contrastive_learning(parser: ArgumentParser):
     p = parser.add_argument_group("Contrastive learning args")
     p.add_argument("--contrast_method", type=str, choices=CHOICE, default="dropout")
+    p.add_argument("--pooling_method", type=str, choices=("mean", "weight", "eos"), default="mean")
+    p.add_argument("--token_id_weight", type=str, help="Map of Token_id to weight")
     # p.add_argument("--mask_parts", type=str, nargs="*", choices=LAT_INFO._fields)
     # p.add_argument("--mask_prob", type=float, default=0.1)
 
@@ -122,11 +124,11 @@ def config_exp_dir(args: Namespace):
     if getattr(args, "init_model"):
         parts.append("init_model")
 
-    for name in ("lr", "optim", "seed", "train_batch", "contrast_method"):
+    for name in ("lr", "optim", "seed", "train_batch", "contrast_method", "pooling_method"):
         if getattr(args, name, None) is not None:
             parts.append(f"{name}-{getattr(args, name)}")
 
-    if getattr(args, "lat_encoder", "") != "":
+    if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
         method = re.findall("(" + "|".join(CHOICE) + ")", getattr(args, "lat_encoder"))
         if len(method) == 1:
             method = method[0]

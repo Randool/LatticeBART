@@ -244,12 +244,14 @@ class LatticeTextDataset(Dataset):
 
         def padding_seqs(seqs: list, pad, max_len, tensor_type):
             for i, seq in enumerate(seqs):
-                seqs[i] = seq + (max_len - len(seq)) * [pad]
+                seqs[i] = max_len * [pad] if (seq is None) else seq + (max_len - len(seq)) * [pad]
             return torch.tensor(seqs, dtype=tensor_type)
 
         def padding_mats(mats: list, pad, shape, tensor_type):
             _mats = torch.zeros(len(mats), *shape, dtype=tensor_type).fill_(pad)
             for i, mat in enumerate(mats):
+                if mat is None:
+                    continue
                 m, n = mat.shape
                 _mats[i, :m, :n] = mat
             return _mats
@@ -280,9 +282,12 @@ class LatticeTextDataset(Dataset):
                     lat = lats[i]
                     if isinstance(lat, nx.DiGraph):
                         lats[i] = lat = line_graph_process(
-                            lat, use_marginal=process_cfg.use_marginal, min_depth=process_cfg.use_min_depth,
-                            max_depth=process_cfg.use_max_depth, forward_backward=process_cfg.use_forward_backward,
-                            use_lattice_mask=process_cfg.use_lattice_mask, binary_mask=process_cfg.binary_mask
+                            lat, use_marginal=(random.random() <= process_cfg.use_marginal),
+                            min_depth=(random.random() <= process_cfg.use_min_depth),
+                            max_depth=(random.random() <= process_cfg.use_max_depth),
+                            forward_backward=(random.random() <= process_cfg.use_forward_backward),
+                            use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
+                            binary_mask=(random.random() <= process_cfg.binary_mask)
                         )
                     elif isinstance(lat, str):  # ark format: <file>:<bias>:<delta>
                         lattice_id, lat = parse_lattice_from_address(lat, to_line_graph=True,
@@ -291,9 +296,12 @@ class LatticeTextDataset(Dataset):
                                                                      ac_scale=process_cfg.ac_scale)
                         assert lattice_id == key, f"Lattice id mismatch between lattice_id ({lattice_id} and key ({key}))"
                         lat = line_graph_process(
-                            lat, use_marginal=process_cfg.use_marginal, min_depth=process_cfg.use_min_depth,
-                            max_depth=process_cfg.use_max_depth, forward_backward=process_cfg.use_forward_backward,
-                            use_lattice_mask=process_cfg.use_lattice_mask, binary_mask=process_cfg.binary_mask
+                            lat, use_marginal=(random.random() <= process_cfg.use_marginal),
+                            min_depth=(random.random() <= process_cfg.use_min_depth),
+                            max_depth=(random.random() <= process_cfg.use_max_depth),
+                            forward_backward=(random.random() <= process_cfg.use_forward_backward),
+                            use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
+                            binary_mask=(random.random() <= process_cfg.binary_mask)
                         )
 
                     input_text, marginal, min_depth, max_depth, fb, lattice_mask = lat
@@ -313,16 +321,11 @@ class LatticeTextDataset(Dataset):
             B, max_len = inputs["input_ids"].shape
             mat_shape = (max_len, max_len)
 
-            inputs["min_depth"] = None if batch_min_depth[0] is None else \
-                padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long)
-            inputs["max_depth"] = None if batch_max_depth[0] is None else \
-                padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long)
-            inputs["lattice_mask"] = None if batch_lat_mask[0] is None else \
-                padding_mats(batch_lat_mask, 0, mat_shape, torch.long)
-            inputs["marginals"] = None if batch_marginal[0] is None else \
-                padding_seqs(batch_marginal, 0, max_len, torch.float)
-            inputs["forward_backward"] = None if batch_fb[0] is None else \
-                padding_mats(batch_fb, 0, mat_shape, torch.float)
+            inputs["min_depth"] = padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long)
+            inputs["max_depth"] = padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long)
+            inputs["lattice_mask"] = padding_mats(batch_lat_mask, 0, mat_shape, torch.long)
+            inputs["marginals"] = padding_seqs(batch_marginal, 0, max_len, torch.float)
+            inputs["forward_backward"] = padding_mats(batch_fb, 0, mat_shape, torch.float)
             inputs["batch_idx"] = torch.arange(B, dtype=torch.long)
 
             if batch_texts[0] is not None:

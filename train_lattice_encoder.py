@@ -3,6 +3,7 @@ Train the encoder of LatticeBart in a contrastive-learning fashion
 """
 import argparse
 import glob
+import json
 import logging
 import time
 from math import ceil, floor
@@ -184,15 +185,22 @@ def evaluate(encoder: EncoderWrapper, tokenizer: BartTokenizer, dataloader: Data
     _state = encoder.training
     encoder.eval()
     total_loss = 0
+    eos_id = tokenizer.eos_token_id
+    pool = args.pooling_method
+    weight = None
+    if args.token_id_weight:
+        with open(args.token_id_weight, encoding="utf8") as f:
+            _weight = json.load(f)
+            weight = {int(key): val for key, val in _weight.items()}
 
     for inputs in dataloader:
         inputs = dict_to_device(inputs, args.device)
         with torch.no_grad():
             if args.contrast_method == "dropout":
-                last_state1 = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
-                last_state2 = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
+                last_state1 = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
+                last_state2 = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
             else:
-                last_state = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
+                last_state = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
                 last_state1 = last_state[::2]
                 last_state2 = last_state[1::2]
 
@@ -219,6 +227,13 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
         else runtime_metric
 
     logging.info("==== Start training ====")
+    eos_id = tokenizer.eos_token_id
+    pool = args.pooling_method
+    weight = None
+    if args.token_id_weight:
+        with open(args.token_id_weight, encoding="utf8") as f:
+            _weight = json.load(f)
+            weight = {int(key): val for key, val in _weight.items()}
 
     for epoch in range(epoch_trained, args.epoch + 1):
         encoder.train()
@@ -230,10 +245,10 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
             inputs = dict_to_device(inputs, args.device)
 
             if args.contrast_method == "dropout":
-                last_state1 = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
-                last_state2 = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
+                last_state1 = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
+                last_state2 = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
             else:  # mask
-                last_state = encoder.forward(**inputs, eos_id=tokenizer.eos_token_id)
+                last_state = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
                 last_state1 = last_state[::2]
                 last_state2 = last_state[1::2]
 
@@ -298,21 +313,21 @@ def main():
     #########################
     process_cfg = DataProcessCfg(
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
-        lm_scale=args.lm_scale, use_marginal=args.use_marginal == 1, use_min_depth=args.use_min_depth == 1,
-        use_max_depth=args.use_max_depth == 1, use_forward_backward=args.use_forward_backward == 1,
-        use_lattice_mask=args.use_lattice_mask == 1, binary_mask=args.use_binary_mask == 1
+        lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
+        use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
+        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask
     )
 
     trainset = devset = None
 
-    if args.train_lats is not None:
+    if args.train_lats is not None or args.train_lat_ark is not None:
         trainset = LatticeTextDataset(lattice_pattern=args.train_lats,
                                       lattice_ark_pattern=args.train_lat_ark,
                                       text_pattern=args.train_text,
                                       cache_dir=join(args.cache_dir, "cache_train"),
                                       process_cfg=process_cfg)
 
-    if args.eval_lats is not None:
+    if args.eval_lats is not None or args.eval_lat_ark is not None:
         devset = LatticeTextDataset(lattice_pattern=args.eval_lats,
                                     lattice_ark_pattern=args.eval_lat_ark,
                                     text_pattern=args.eval_text,
@@ -322,8 +337,10 @@ def main():
     #######################
     ######## Train ########
     #######################
-    if trainset is None or len(trainset) == 0 or devset is None or len(devset) == 0:
+    if trainset is None or len(trainset) == 0:
         logging.info("No valid training data. Training phase is passed.")
+    elif devset is None or len(devset) == 0:
+        logging.info("No valid validation data. Training phase is passed.")
     else:
         encoder, tokenizer = get_encoder_and_tokenizer(args)
 
