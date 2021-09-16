@@ -1,8 +1,10 @@
 import logging
+from itertools import product
 from typing import List
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from nltk.translate.bleu_score import corpus_bleu
 
 
@@ -89,7 +91,7 @@ class ErrorState:
         other.total_cost = self.total_cost
 
 
-def LevenshteinEditDistance(ref: List[str], hyp: List[str]) -> ErrorState:
+def levenshtein_edit_distance(ref: List[str], hyp: List[str]) -> ErrorState:
     e = [ErrorState() for _ in range(len(ref) + 1)]
     cur_e = [ErrorState() for _ in range(len(ref) + 1)]
 
@@ -140,7 +142,7 @@ def WER(refers: List[List[str]], hypos: List[List[str]], is_wer=True) -> float:
 
     for ref, hyp in zip(refers, hypos):
         num_words += len(ref)
-        state = LevenshteinEditDistance(ref, hyp)
+        state = levenshtein_edit_distance(ref, hyp)
         ins_num += state.ins_num
         del_num += state.del_num
         sub_num += state.sub_num
@@ -156,3 +158,91 @@ def WER(refers: List[List[str]], hypos: List[List[str]], is_wer=True) -> float:
     logging.info(f"{leader} = {wer:.2%}, INS = {ins_num} ({ins_num / num_words:.2%}), "
                  f"DEL = {del_num} ({del_num / num_words:.2%}), SUB={sub_num} ({sub_num / num_words:.2%})")
     return wer
+
+
+def cos_similarity_mtx(vectors1, vectors2):
+    """ vectors[1|2] of shape [B, D], return [B, B] """
+    n1, n2 = vectors1.norm(dim=1, keepdim=True), vectors2.norm(dim=1, keepdim=True)
+    eps = torch.finfo(n1.dtype).eps
+    norm_1 = vectors1 / torch.clamp(n1, min=eps)
+    norm_2 = vectors2 / torch.clamp(n2, min=eps)
+    sim_mtx = torch.mm(norm_1, norm_2.transpose(0, 1))
+    return sim_mtx
+
+
+def show_similarity_mtx(mtx, include_values=False, display_labels: list = None, cmap='viridis',
+                        xticks_rotation=60, values_format: str = None):
+    """
+    Args:
+        mtx:            similarity matrix of shape [n_classes, n_classes]
+        include_values: include values in the graph
+        display_labels: display labels on x-tick and y-tick
+        cmap:           see: https://matplotlib.org/stable/tutorials/colors/colormaps.html
+        xticks_rotation:    x-ticks rotation degree
+        values_format:  values format
+    """
+    import matplotlib.pyplot as plt
+
+    if torch.is_tensor(mtx):
+        mtx = mtx.detach().cpu().numpy()
+
+    n_classes = mtx.shape[0]
+
+    fig, ax = plt.subplots()
+    W = 8 * n_classes / 32
+    H = 6 * n_classes / 32
+    fig.set_size_inches(W, H)   # W, H
+    im_ = ax.imshow(mtx, interpolation='nearest', cmap=cmap)
+    cmap_min, cmap_max = im_.cmap(0), im_.cmap(256)
+
+    if include_values:
+        text_ = np.empty_like(mtx, dtype=object)
+        thresh = (mtx.max() + mtx.min()) / 2.0
+
+        for i, j in product(range(n_classes), range(n_classes)):
+            color = cmap_max if mtx[i, j] < thresh else cmap_min
+
+            if values_format is None:
+                text_cm = format(mtx[i, j], '.2g')
+                if mtx.dtype.kind != 'f':
+                    text_d = format(mtx[i, j], 'd')
+                    if len(text_d) < len(text_cm):
+                        text_cm = text_d
+            else:
+                text_cm = format(mtx[i, j], values_format)
+
+            text_[i, j] = ax.text(j, i, text_cm, ha="center", va="center", color=color)
+
+    if display_labels is None:
+        display_labels = np.arange(n_classes)
+
+    fig.colorbar(im_, ax=ax)
+    ax.set(xticks=np.arange(n_classes), yticks=np.arange(n_classes),
+           xticklabels=display_labels, yticklabels=display_labels)
+
+    ax.set_ylim((n_classes - 0.5, -0.5))
+    plt.xticks(rotation=xticks_rotation)
+
+    return fig
+
+
+def contrastive_loss(sim_mtx, reduction="mean", improved=False):
+    assert sim_mtx.shape[-2] == sim_mtx.shape[-1]
+
+    if improved:
+        """
+        Contrastive loss improved by `Simpler, Faster, Stronger:
+            Breaking The log-K Curse On Contrastive Learners With FlatNCE`
+        """
+        exp_mtx = torch.exp(sim_mtx)
+        diag_val = torch.diagonal(exp_mtx)
+        loss = torch.log(exp_mtx.sum(dim=1) - diag_val) - diag_val
+        if reduction == "mean":
+            loss = loss.mean()
+        elif reduction == "sum":
+            loss = loss.sum()
+    else:
+        index = torch.arange(0, sim_mtx.shape[-1], dtype=torch.long, device=sim_mtx.device)
+        loss = F.cross_entropy(sim_mtx, index, reduction=reduction)
+
+    return loss

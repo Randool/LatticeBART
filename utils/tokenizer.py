@@ -1,7 +1,66 @@
-from typing import List
+import random
+import re
+from collections import defaultdict
+from typing import List, Tuple
 
+import cmudict
 import torch
+from g2p_en import G2p
 from transformers import BartTokenizer
+
+
+class HomophoneReplacer:
+    def __init__(self):
+        self.CMU_dict = {k.lower(): tuple(v) for k, v in cmudict.entries()}
+        self.CMU_dict_unstressed = {}
+        self.g2p = G2p()  # Grapheme to phone guesser
+
+        self.pron_to_tokens = defaultdict(list)
+        for k, v in self.CMU_dict.items():
+            self.pron_to_tokens[v].append(k)
+            self.pron_to_tokens[self.unstressed(v)].append(k)
+
+    def _pronunciation(self, token: str) -> Tuple[str]:
+        """ Look up and cache pronunciation """
+        if token in self.CMU_dict:
+            return self.CMU_dict[token]
+        pron = self.CMU_dict[token] = tuple(self.g2p(token))
+        self.pron_to_tokens[pron].append(token)
+        return pron
+
+    @staticmethod
+    def unstressed(pron: Tuple[str]) -> Tuple[str]:
+        return tuple(p[:-1] if p[-1].isdigit() else p for p in pron)
+
+    def find_homophones(self, token: str) -> List[str]:
+        token = token.lower()
+        pron = self._pronunciation(token)
+        homophones = self.pron_to_tokens.get(pron)
+
+        if homophones is None:  # Miss and Loop up for the first time
+            unstressed_pron = self.unstressed(pron)
+            homophones = self.pron_to_tokens[pron] = self.pron_to_tokens[unstressed_pron]
+
+        try:
+            homophones.remove(token)
+        except ValueError:
+            pass
+
+        return homophones
+
+    def process_sent(self, sent: str, ratio=0.1) -> str:
+        assert 0 <= ratio <= 1, f"The value of ratio ({ratio}) is out of range"
+        tokens = re.split("\\s+", re.sub("[.!?]", "", sent))
+
+        for i, token in enumerate(tokens):
+            if random.random() <= ratio:
+                homos = self.find_homophones(token)
+                if len(homos) == 0:
+                    continue
+                homo = random.choice(homos)
+                tokens[i] = homo
+
+        return " ".join(tokens)
 
 
 def word_based_tokenize(srcs: List[str], tokenizer: BartTokenizer, lower=False, return_attention=True,

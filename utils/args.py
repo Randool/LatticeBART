@@ -19,8 +19,6 @@ def add_args_for_model_construct(parser: ArgumentParser):
     p.add_argument("--lat_bart_path", type=str, help="Pretrained LatticeBart path")
     p.add_argument("--lat_encoder", type=str, help="Pretrained LatticeEncoder path")
 
-    p.add_argument("--checkpoint", type=str, help="checkpoint, epoch_n")
-
 
 def add_args_for_lr(parser: ArgumentParser):
     p = parser.add_argument_group("Lr params")
@@ -35,13 +33,15 @@ def add_args_for_data_path(parser: ArgumentParser):
     p = parser.add_argument_group("Dataset path")
     p.add_argument("--cache_dir", type=str, help="Path to cache processed data")
 
-    p.add_argument("--train_lats", type=str, help="/path/to/lattice")
-    p.add_argument("--eval_lats", type=str, help="/path/to/lattice")
-    p.add_argument("--test_lats", type=str, nargs="*", default=[], help="/path/to/lattice")
+    p.add_argument("--train_lat", type=str, help="/path/to/lattice")
+    p.add_argument("--eval_lat", type=str, help="/path/to/lattice")
+    p.add_argument("--test_lat", type=str, nargs="*", default=[], help="/path/to/lattice")
+    p.add_argument("--debug_lat", type=str, help="/path/to/lattice")
 
     p.add_argument("--train_lat_ark", type=str, help="/path/to/lattice ark file")
     p.add_argument("--eval_lat_ark", type=str, help="/path/to/lattice ark file")
     p.add_argument("--test_lat_ark", type=str, nargs="*", default=[], help="/path/to/lattice ark file")
+    p.add_argument("--debug_lat_ark", type=str, help="/path/to/lattice ark file")
 
     p.add_argument("--train_text", type=str, help="/path/to/text")
     p.add_argument("--eval_text", type=str, help="/path/to/text")
@@ -50,7 +50,6 @@ def add_args_for_data_path(parser: ArgumentParser):
 
 def add_args_for_data_process(parser: ArgumentParser):
     p = parser.add_argument_group("Data processing")
-    p.add_argument("--sort_by_len", type=int, choices=(0, 1), default=1)
 
     p.add_argument("--lm_scale", type=float, default=1.0)
     p.add_argument("--ac_scale", type=float, default=1.0)
@@ -64,6 +63,8 @@ def add_args_for_data_process(parser: ArgumentParser):
     p.add_argument("--use_forward_backward", type=float, default=1.0, help="Prob. of using forward-backward scores")
     p.add_argument("--use_lattice_mask", type=float, default=1.0, help="Prob. of using lattice mask")
     p.add_argument("--use_binary_mask", type=float, default=1.0, help="Prob. of using binary mask")
+
+    p.add_argument("--homophone_replace", type=float, default=0.0, help="Prob. of replace token with homophone")
 
 
 def add_args_for_train_procedure(parser: ArgumentParser):
@@ -91,14 +92,11 @@ def add_args_for_contrastive_learning(parser: ArgumentParser):
     p.add_argument("--contrast_method", type=str, choices=CHOICE, default="dropout")
     p.add_argument("--pooling_method", type=str, choices=("mean", "weight", "eos"), default="mean")
     p.add_argument("--token_id_weight", type=str, help="Map of Token_id to weight")
-    # p.add_argument("--mask_parts", type=str, nargs="*", choices=LAT_INFO._fields)
-    # p.add_argument("--mask_prob", type=float, default=0.1)
 
 
 def add_args_for_seq2seq_train(parser: ArgumentParser):
     p = parser.add_argument_group("Seq2Seq training args")
     p.add_argument("--contrast_method", type=str, choices=CHOICE + ("none",), default="none")
-    # p.add_argument("--n_lat", type=int, choices=(1, 2), default=1, help="Used in `collate_fn`.")
 
 
 def add_args_for_seq2seq_generation(parser: ArgumentParser):
@@ -110,23 +108,29 @@ def add_args_for_seq2seq_generation(parser: ArgumentParser):
 
 ####### CONFIG #######
 
+name_abbr = {
+    "init_model": "init", "lat_enc_layers": "nlayer", "lr": "lr", "optim": "optim", "seed": "seed",
+    "train_batch": "batch", "contrast_method": "contrast", "pooling_method": "pool",
+    "use_marginal": "m", "use_min_depth": "mD", "use_max_depth": "MD", "use_forward_backward": "fb",
+    "use_lattice_mask": "MSK", "use_binary_mask": "binM", "homophone_replace": "homo"
+}
+
+
 def config_exp_dir(args: Namespace):
     # Normal configs
     parts = []
-    if getattr(args, "bart_path", None) is not None:
-        parts.append(f'bart_path-{getattr(args, "bart_path").rstrip("/").split("/")[-1]}')
-    elif getattr(args, "lat_bart_path", None) is not None:
-        value = re.sub("^.*bart_path-", "", getattr(args, "lat_bart_path")).split(",")[0]
-        parts.append(f'bart_path-{value}')
+
+    # Model size
+    if getattr(args, "default_config"):
+        parts.append(f'SZ-{getattr(args, "default_config")}')
+    elif getattr(args, "bart_path"):
+        size = re.match(r".*bart-(?P<size>\w+)", getattr(args, "bart_path")).group("size")
+        parts.append(f'SZ-{size}')
+    elif getattr(args, "lat_bart_path"):
+        size = re.match(r".*(SZ|bart)-(?P<size>\w+)", getattr(args, "lat_bart_path")).group("size")
+        parts.append(f'SZ-{size}')
     else:
         raise ValueError("One of --bart_path and --lat_bart_path should be set")
-
-    if getattr(args, "init_model"):
-        parts.append("init_model")
-
-    for name in ("lr", "optim", "seed", "train_batch", "contrast_method", "pooling_method"):
-        if getattr(args, name, None) is not None:
-            parts.append(f"{name}-{getattr(args, name)}")
 
     if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
         method = re.findall("(" + "|".join(CHOICE) + ")", getattr(args, "lat_encoder"))
@@ -136,17 +140,32 @@ def config_exp_dir(args: Namespace):
             raise ValueError(f"Can not find any choices ({CHOICE}) in `lat_encoder`")
         else:
             raise ValueError(f"Multiple choices on `{CHOICE}` in `lat_encoder`")
-        parts.append(f"method-{method}")
+        parts.append(f"ENC-{method}")
+
+    if getattr(args, "init_model"):
+        parts.append("init")
+
+    for name in ("lat_enc_layers", "lr", "optim", "seed", "train_batch", "contrast_method", "pooling_method"):
+        val = getattr(args, name, None)
+        if val is not None:
+            name = name_abbr[name]
+            parts.append(f"{name}-{val}")
 
     if "cuda" in args.device and torch.cuda.device_count() > 1:
         parts.append(f"gpu-{torch.cuda.device_count()}")
 
     # Data processing configs with particularity
-    names = ("sort_by_len", "use_marginal", "use_min_depth", "use_max_depth",
-             "use_forward_backward", "use_lattice_mask", "use_binary_mask")
+    names = (
+        "use_marginal", "use_min_depth", "use_max_depth", "use_forward_backward",
+        "use_lattice_mask", "use_binary_mask", "homophone_replace"
+    )
     for name in names:
-        if getattr(args, name) == 0:
-            parts.append(f"{name}-{0}")
+        val = getattr(args, name, None)
+        if val is not None:
+            if isinstance(val, int):
+                parts.append(f"{name_abbr[name]}-{val}")
+            else:
+                parts.append(f"{name_abbr[name]}-{val:.2f}")
 
     args.exp_dir = join(args.exp_dir, ",".join(parts))
 

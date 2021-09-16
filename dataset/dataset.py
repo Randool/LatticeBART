@@ -14,7 +14,7 @@ from torch.utils.data.dataset import Dataset
 from transformers import BartTokenizer, BatchEncoding
 
 from dataset.parse import parse_lattice_file, line_graph_process, parse_lattice_from_address
-from utils.tokenizer import word_based_tokenize
+from utils.tokenizer import word_based_tokenize, HomophoneReplacer
 
 MAX_NODEs = int(1e3)
 
@@ -48,6 +48,7 @@ def _cache_data(data, cache_file: str):
 
 class _KeyBased:
     items: Dict[str, Any]
+    n_files = 0
 
     def keys(self):
         yield from self.items.keys()
@@ -73,7 +74,10 @@ class _LatticeDataset(_KeyBased):
             cache_dir = join(cache_dir, key)
             os.makedirs(cache_dir, exist_ok=True)
 
-        for file in sorted(glob.glob(lattice_file_pattern)):
+        files = sorted(glob.glob(lattice_file_pattern))
+        self.n_files = len(files)
+
+        for file in files:
             if cache_dir is not None:
                 filename = join(cache_dir, f"{split(file)[-1]}.cache")
                 if exists(filename):
@@ -115,7 +119,10 @@ class _LatticeArkDataset(_KeyBased):
     def __init__(self, lattice_ark_pattern: str):
         self.items = {}
 
-        for file in sorted(glob.glob(lattice_ark_pattern)):
+        files = sorted(glob.glob(lattice_ark_pattern))
+        self.n_files = len(files)
+
+        for file in files:
             with open(file, encoding="utf8") as f:
                 for line in f:
                     line = line.strip()
@@ -135,6 +142,7 @@ class __TextDataset(_KeyBased):
 
         # Read data
         files = sorted(glob.glob(text_file_pattern))
+        self.n_files = len(files)
         if len(files) == 0:
             raise FileNotFoundError("No text files found")
 
@@ -167,7 +175,7 @@ class __TextDataset(_KeyBased):
                 if token_split:
                     tokens = tokens.split()
                 items.append((_id, tokens))
-        logging.warning(f"{empty_sent} empty sentences found in {text_file}")
+        # logging.warning(f"{empty_sent} empty sentences found in {text_file}")
         return items
 
 
@@ -183,10 +191,10 @@ class _TextDataset(__TextDataset):
 
 DataProcessCfg = namedtuple("DataProcessCfg", (
     "min_nodes", "max_nodes", "lower_case", "ac_scale", "lm_scale", "use_marginal", "use_min_depth",
-    "use_max_depth", "use_forward_backward", "use_lattice_mask", "binary_mask"
+    "use_max_depth", "use_forward_backward", "use_lattice_mask", "binary_mask", "homophone_replace"
 ))
 
-_default_cfg = DataProcessCfg(1, 200, True, 1.0, 1.0, True, True, True, True, True, True)
+_default_cfg = DataProcessCfg(1, 200, True, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0)
 
 
 class LatticeTextDataset(Dataset):
@@ -203,17 +211,17 @@ class LatticeTextDataset(Dataset):
             lattices = _LatticeDataset(lattice_pattern, cache_dir=cache_dir, min_nodes=self.process_cfg.min_nodes,
                                        max_nodes=self.process_cfg.max_nodes, lower_case=self.process_cfg.lower_case,
                                        ac_scale=self.process_cfg.ac_scale, lm_scale=self.process_cfg.lm_scale)
+            self.n_files = lattices.n_files
         else:
             lattices = _LatticeArkDataset(lattice_ark_pattern)
-
-        keys = set(lattices.keys())
+            self.n_files = lattices.n_files
 
         if text_pattern is None:
-            self.items = [[key, lattices[key], None] for key in sorted(keys)]
+            self.items = [[key, lattices[key], None] for key in lattices.keys()]
         else:
             transcripts = _TextDataset(text_pattern, lower_case=self.process_cfg.lower_case)
-            keys = keys & set(transcripts.keys())
-            self.items = [[key, lattices[key], transcripts[key]] for key in sorted(keys)]
+            common_keys = set(lattices.keys()) & set(transcripts.keys())
+            self.items = [[key, lattices[key], transcripts[key]] for key in lattices.keys() if key in common_keys]
 
         logging.info(f"{self.__class__.__name__}: {len(self)} items.")
 
@@ -241,6 +249,8 @@ class LatticeTextDataset(Dataset):
                            process_cfg: DataProcessCfg = None):
         if process_cfg is None:
             process_cfg = self.process_cfg
+
+        homophone_replacer = HomophoneReplacer()
 
         def padding_seqs(seqs: list, pad, max_len, tensor_type):
             for i, seq in enumerate(seqs):
@@ -294,7 +304,11 @@ class LatticeTextDataset(Dataset):
                                                                      lower_case=process_cfg.lower_case,
                                                                      lm_scale=process_cfg.lm_scale,
                                                                      ac_scale=process_cfg.ac_scale)
-                        assert lattice_id == key, f"Lattice id mismatch between lattice_id ({lattice_id} and key ({key}))"
+
+                        # `key.startswith(lattice_id)` is used when do contrastive learning
+                        assert lattice_id == key or key.startswith(lattice_id), \
+                            f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
+
                         lat = line_graph_process(
                             lat, use_marginal=(random.random() <= process_cfg.use_marginal),
                             min_depth=(random.random() <= process_cfg.use_min_depth),
@@ -311,6 +325,11 @@ class LatticeTextDataset(Dataset):
                     batch_lat_mask.append(lattice_mask)
                     batch_fb.append(fb)
                     batch_marginal.append(marginal)
+
+            # Replace homophone
+            if process_cfg.homophone_replace > 0:
+                batch_input_seqs = [homophone_replacer.process_sent(s, ratio=process_cfg.homophone_replace) for s in
+                                    batch_input_seqs]
 
             inputs = word_based_tokenize(batch_input_seqs, tokenizer, lower=True,
                                          return_attention=False, to_tensor=True)

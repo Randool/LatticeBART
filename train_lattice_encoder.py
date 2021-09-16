@@ -7,10 +7,9 @@ import json
 import logging
 import time
 from math import ceil, floor
-from os.path import exists, dirname
-from typing import Union
+from os.path import exists
+from typing import Union, List
 
-import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -23,10 +22,11 @@ from models.lattice_bart import LatticeBart
 from models.utils import config_layer_wise_lr, model_init
 from utils.args import *
 from utils.lamb import Lamb
+from utils.metric import cos_similarity_mtx, contrastive_loss, show_similarity_mtx
 from utils.utils import set_seed, set_logger, RuntimeMetric
 
 
-def parse_args_and_setup_hyper_param() -> Namespace:
+def parse_args_and_setup_hyper_param(_args: List[str] = None) -> Namespace:
     psr = argparse.ArgumentParser()
     add_args_for_model_construct(psr)
     add_args_for_lr(psr)
@@ -34,7 +34,7 @@ def parse_args_and_setup_hyper_param() -> Namespace:
     add_args_for_data_process(psr)
     add_args_for_train_procedure(psr)
     add_args_for_contrastive_learning(psr)
-    args = psr.parse_args()
+    args = psr.parse_args(_args)
 
     for key, val in list(vars(args).items()):
         if val is None:
@@ -50,26 +50,66 @@ def parse_args_and_setup_hyper_param() -> Namespace:
     return args
 
 
+def select_best_checkpoint(exp_dir: str, use_metric: str):
+    metrics = glob.glob(join(exp_dir, "epoch_*", "metric_*"))
+    if len(metrics) == 0:
+        return None
+
+    best_exp_dir, best_metric, largest_n = None, None, -1
+
+    for m in metrics:
+        *prefix, metric = m.split("/")
+        prefix = "/".join(prefix)
+        metric = float(metric.split("_")[-1])
+        n = int(re.match(r".*epoch_(?P<n>\d+).*", prefix).group("n"))
+
+        if best_metric is None:
+            best_metric = metric
+            largest_n = n
+            best_exp_dir = prefix
+        else:
+            if use_metric in ("cer", "wer", "loss"):
+                if best_metric > metric or (best_metric == metrics and n > largest_n):
+                    best_metric = metric
+                    best_exp_dir = prefix
+                    largest_n = n
+            else:
+                if best_metric < metric and (best_metric == metrics and n > largest_n):
+                    best_metric = metric
+                    best_exp_dir = prefix
+                    largest_n = n
+
+    logging.info(f"Select checkpoint {best_exp_dir}")
+
+    return best_exp_dir
+
+
 def get_encoder_and_tokenizer(args: Namespace):
-    if args.default_config is not None:
-        encoder = LatticeBart(get_model_config(args.default_config)).get_encoder()
-        tokenizer = get_tokenizer()
-    elif args.bart_path is not None:
-        encoder = LatticeBart.from_bart(bart_path=args.bart_path, depth_clip=args.depth_clip,
-                                        lat_enc_layers=args.lat_enc_layers).get_encoder()
-        tokenizer = BartTokenizer.from_pretrained(args.bart_path)
-    elif args.lat_bart_path is not None:
-        encoder = LatticeBart.from_pretrained(args.lat_bart_path).get_encoder()
-        tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
+    ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric)
+    if ckpt_dir is not None:
+        encoder = EncoderWrapper.from_pretrained(ckpt_dir)
+        tokenizer = BartTokenizer.from_pretrained(args.exp_dir)
+        logging.info(f"Load checkpoint from '{ckpt_dir}'")
     else:
-        logging.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
-        raise ValueError("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
+        if args.default_config is not None:
+            encoder = LatticeBart(get_model_config(args.default_config)).get_encoder()
+            tokenizer = get_tokenizer()
+        elif args.bart_path is not None:
+            encoder = LatticeBart.from_bart(bart_path=args.bart_path, depth_clip=args.depth_clip,
+                                            lat_enc_layers=args.lat_enc_layers).get_encoder()
+            tokenizer = BartTokenizer.from_pretrained(args.bart_path)
+        elif args.lat_bart_path is not None:
+            encoder = LatticeBart.from_pretrained(args.lat_bart_path).get_encoder()
+            tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
+        else:
+            logging.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
+            raise ValueError("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
 
-    encoder = EncoderWrapper(encoder)
+        if args.init_model:
+            logging.info("[!] Initialize model parameters.")
+            model_init(encoder, std=encoder.config.init_std, except_modules=(encoder.embed_tokens,))
 
-    if args.init_model:
-        logging.info("[!] Initialize model parameters.")
-        model_init(encoder, std=encoder.config.init_std, except_modules=())
+        encoder = EncoderWrapper(encoder)
 
     # If you have multiple GPUs, why not use them?
     if "cuda" in args.device and torch.cuda.device_count() > 1:
@@ -120,67 +160,6 @@ def save_checkpoint(epoch: int, metric, model, optimizer, tokenizer: BartTokeniz
     logging.info(f"Save checkpoints to {exp_dir}")
 
 
-def select_best_checkpoint(exp_dir: str, use_metric: str):
-    metrics = glob.glob(join(exp_dir, "epoch_*", "metric_*"))
-    if len(metrics) == 0:
-        return None
-
-    best_exp_dir, best_metric = None, None
-
-    for m in metrics:
-        *_prefix, metric = m.split("/")
-        metric = float(metric.split("_")[-1])
-
-        if best_metric is None:
-            best_metric = metric
-            best_exp_dir = "/".join(_prefix)
-        else:
-            if use_metric in ("cer", "wer", "loss"):
-                if best_metric >= metric:
-                    best_metric = metric
-                    best_exp_dir = "/".join(_prefix)
-            else:
-                if best_metric <= metric:
-                    best_metric = metric
-                    best_exp_dir = "/".join(_prefix)
-
-    logging.info(f"Select checkpoint {best_exp_dir}")
-
-    return best_exp_dir
-
-
-def cos_similarity_mtx(vectors1, vectors2):
-    """ vectors[1|2] of shape [B, D], return [B, B] """
-    n1, n2 = vectors1.norm(dim=1, keepdim=True), vectors2.norm(dim=1, keepdim=True)
-    eps = torch.finfo(n1.dtype).eps
-    norm_1 = vectors1 / torch.clamp(n1, min=eps)
-    norm_2 = vectors2 / torch.clamp(n2, min=eps)
-    sim_mtx = torch.mm(norm_1, norm_2.transpose(0, 1))
-    return sim_mtx
-
-
-def contrastive_loss(sim_mtx, reduction="mean", improved=True):
-    assert sim_mtx.shape[-2] == sim_mtx.shape[-1]
-
-    if improved:
-        """
-        Contrastive loss improved by `Simpler, Faster, Stronger:
-            Breaking The log-K Curse On Contrastive Learners With FlatNCE`
-        """
-        exp_mtx = torch.exp(sim_mtx)
-        diag_val = torch.diagonal(exp_mtx)
-        loss = torch.log(exp_mtx.sum(dim=1) - diag_val) - diag_val
-        if reduction == "mean":
-            loss = loss.mean()
-        elif reduction == "sum":
-            loss = loss.sum()
-    else:
-        index = torch.arange(0, sim_mtx.shape[-1], dtype=torch.long, device=sim_mtx.device)
-        loss = F.cross_entropy(sim_mtx, index, reduction=reduction)
-
-    return loss
-
-
 def evaluate(encoder: EncoderWrapper, tokenizer: BartTokenizer, dataloader: DataLoader, args: Namespace) -> dict:
     _state = encoder.training
     encoder.eval()
@@ -204,8 +183,8 @@ def evaluate(encoder: EncoderWrapper, tokenizer: BartTokenizer, dataloader: Data
                 last_state1 = last_state[::2]
                 last_state2 = last_state[1::2]
 
-        sim_mtx = cos_similarity_mtx(last_state1, last_state2)  # [B, B]
-        total_loss += contrastive_loss(sim_mtx).item()
+            sim_mtx = cos_similarity_mtx(last_state1, last_state2)  # [B, B]
+            total_loss += contrastive_loss(sim_mtx).item()
 
     if _state:
         encoder.train()
@@ -215,9 +194,47 @@ def evaluate(encoder: EncoderWrapper, tokenizer: BartTokenizer, dataloader: Data
     return {"loss": avg_loss}
 
 
+def show_similarity_matrix(encoder: EncoderWrapper, tokenizer: BartTokenizer, dataloader: DataLoader, args: Namespace,
+                           writer: SummaryWriter, global_step: int):
+    _state = encoder.training
+    encoder.eval()
+
+    total_loss = 0
+    eos_id = tokenizer.eos_token_id
+    pool = args.pooling_method
+    weight = None
+    if args.token_id_weight:
+        with open(args.token_id_weight, encoding="utf8") as f:
+            _weight = json.load(f)
+            weight = {int(key): val for key, val in _weight.items()}
+
+    for i, inputs in enumerate(dataloader):
+        key = inputs.pop("key", None)
+        if key is None:
+            key = [i for i in range(len(inputs["input_ids"]))]
+
+        with torch.no_grad():
+            inputs = dict_to_device(inputs, args.device)
+            last_state = encoder.forward(**inputs, eos_id=eos_id, pooling_method=pool, token_id_weight=weight)
+            last_state1 = last_state[::2]
+            last_state2 = last_state[1::2]
+
+            sim_mtx = cos_similarity_mtx(last_state1, last_state2)  # [B, B]
+            total_loss += contrastive_loss(sim_mtx).item()
+
+            fig = show_similarity_mtx(sim_mtx, include_values=False, display_labels=key)
+            writer.add_figure(tag=f"SimilarityMtx_{i}", figure=fig, global_step=global_step)
+
+    if _state:
+        encoder.train()
+
+    avg_loss = total_loss / len(dataloader)
+    writer.add_scalar(tag="Similarity Mtx Loss", scalar_value=avg_loss, global_step=global_step)
+
+
 def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokenizer, train_loader: DataLoader,
           dev_loader: DataLoader, optimizer, scheduler, writer: SummaryWriter, args: Namespace, epoch_trained=1,
-          runtime_metric: RuntimeMetric = None):
+          runtime_metric: RuntimeMetric = None, debug_loader: DataLoader = None):
     # Model
     encoder.to(args.device)
 
@@ -239,6 +256,7 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
         encoder.train()
 
         max_steps = len(train_loader)
+        summary_every = max_steps // 10
         tic = time.time()
 
         for step, inputs in enumerate(train_loader, start=1):
@@ -280,6 +298,11 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
                 optimizer.zero_grad()
                 scheduler.step()
 
+            # Show similarity matrix for manually selected lattices
+            if step % summary_every == 0:
+                if debug_loader is not None:
+                    show_similarity_matrix(encoder, tokenizer, debug_loader, args, writer, global_step)
+
         span = (time.time() - tic) / 60
         logging.info(f"Epoch {epoch} training finish. Cost {span:.1f} min")
 
@@ -305,8 +328,8 @@ def train(encoder: Union[EncoderWrapper, nn.DataParallel], tokenizer: BartTokeni
             break
 
 
-def main():
-    args = parse_args_and_setup_hyper_param()
+def main(_args: List[str] = None):
+    args = parse_args_and_setup_hyper_param(_args)
 
     #########################
     ######## Dataset ########
@@ -315,24 +338,36 @@ def main():
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
         use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
-        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask
+        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
+        homophone_replace=args.homophone_replace
+    )
+    process_cfg_for_test = DataProcessCfg(
+        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
+        lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
+        use_lattice_mask=1, binary_mask=1, homophone_replace=0
     )
 
-    trainset = devset = None
+    trainset = devset = debug_set = None
 
-    if args.train_lats is not None or args.train_lat_ark is not None:
-        trainset = LatticeTextDataset(lattice_pattern=args.train_lats,
+    if args.train_lat is not None or args.train_lat_ark is not None:
+        trainset = LatticeTextDataset(lattice_pattern=args.train_lat,
                                       lattice_ark_pattern=args.train_lat_ark,
-                                      text_pattern=args.train_text,
                                       cache_dir=join(args.cache_dir, "cache_train"),
                                       process_cfg=process_cfg)
 
-    if args.eval_lats is not None or args.eval_lat_ark is not None:
-        devset = LatticeTextDataset(lattice_pattern=args.eval_lats,
+    if args.eval_lat is not None or args.eval_lat_ark is not None:
+        devset = LatticeTextDataset(lattice_pattern=args.eval_lat,
                                     lattice_ark_pattern=args.eval_lat_ark,
-                                    text_pattern=args.eval_text,
                                     cache_dir=join(args.cache_dir, "cache_dev"),
-                                    process_cfg=process_cfg)
+                                    process_cfg=process_cfg_for_test)
+
+    if args.debug_lat is not None or args.debug_lat_ark is not None:
+        debug_set = LatticeTextDataset(lattice_pattern=args.debug_lat,
+                                       lattice_ark_pattern=args.debug_lat_ark,
+                                       cache_dir=join(args.cache_dir, "cache_dev"),
+                                       process_cfg=process_cfg_for_test)
+
+    writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
 
     #######################
     ######## Train ########
@@ -345,10 +380,21 @@ def main():
         encoder, tokenizer = get_encoder_and_tokenizer(args)
 
         collate_fn = trainset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
-        train_loader = DataLoader(trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.num_workers,
-                                  collate_fn=collate_fn, drop_last=isinstance(encoder, nn.DataParallel))
-        dev_loader = DataLoader(devset, batch_size=args.eval_batch, shuffle=False,
-                                num_workers=args.num_workers, collate_fn=collate_fn)
+
+        train_loader = DataLoader(
+            trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.num_workers,
+            collate_fn=collate_fn, drop_last=isinstance(encoder, nn.DataParallel)
+        )
+        dev_loader = DataLoader(
+            devset, batch_size=args.eval_batch, shuffle=False,
+            num_workers=args.num_workers, collate_fn=collate_fn
+        )
+        assert abs(len(debug_set) // debug_set.n_files * debug_set.n_files - len(debug_set)) <= 1e-4, \
+            "Debug dataset files have different lattice number."
+        debug_loader = DataLoader(
+            debug_set, batch_size=len(debug_set) // debug_set.n_files, shuffle=False, num_workers=args.num_workers,
+            collate_fn=trainset.partial_collate_fn(tokenizer, n_lat=2, return_keys=True)
+        ) if debug_set is not None else None
 
         optimizer = config_optimizer(encoder, args)
         total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
@@ -362,30 +408,31 @@ def main():
         mtc = RuntimeMetric(None, window_size=10, patience=args.patience,
                             decrease=(args.use_metric in ("cer", "wer", "loss")))
         epoch_trained = 1
-        writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
 
         ####################
         ### Fast Forward ###
         ####################
-        if args.checkpoint:
-            epoch_trained = int(dirname(args.checkpoint).split("_")[-1])
+        ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric)
+        if ckpt_dir is not None:
+            epoch_trained = int(re.match(r".*epoch_(?P<n>\d+).*", ckpt_dir).group("n"))
             step_trained = ceil(epoch_trained * len(trainset) / (args.train_batch * args.grad_acc_steps))
 
-            optimizer.load_state_dict(torch.load(join(args.checkpoint, "optim.pt")))
+            optimizer.load_state_dict(torch.load(join(ckpt_dir, "optim.pt"), map_location=args.device))
 
-            for i in range(step_trained):
+            for _ in range(step_trained):
                 scheduler.step()
 
             for i in range(epoch_trained):
                 for _ in train_loader:
                     break
+                logging.info(f"Pass epoch {i + 1}")
 
-            mtc = RuntimeMetric.load(join(args.checkpoint, "runtime_metric.json"))
+            mtc = RuntimeMetric.load(join(ckpt_dir, "runtime_metric.json"))
 
         try:
             train(encoder=encoder, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader,
                   optimizer=optimizer, scheduler=scheduler, writer=writer, args=args, epoch_trained=epoch_trained,
-                  runtime_metric=mtc)
+                  runtime_metric=mtc, debug_loader=debug_loader)
         except KeyboardInterrupt:
             logging.info("Interrupt by user.")
 
@@ -395,12 +442,12 @@ def main():
     if exp_dir is None:
         logging.warning("No checkpoints found.")
     else:
-        if len(args.test_lats) == 0 and len(args.test_lat_ark) == 0:
+        if len(args.test_lat) == 0 and len(args.test_lat_ark) == 0:
             logging.error("No test data found.")
             return
-        if len(args.test_lats) > 0 and len(args.test_lat_ark) > 0:
-            logging.error(f"Only one `--test_lats` and `--test_lat_ark` of can be set. "
-                          f"Got: test_lats: {args.test_lats}, test_lat_ark: {args.test_lat_ark}")
+        if len(args.test_lat) > 0 and len(args.test_lat_ark) > 0:
+            logging.error(f"Only one `--test_lat` and `--test_lat_ark` of can be set. "
+                          f"Got: test_lat: {args.test_lat}, test_lat_ark: {args.test_lat_ark}")
             return
         try:
             encoder = EncoderWrapper.from_pretrained(exp_dir).to(args.device).eval()
@@ -413,16 +460,16 @@ def main():
             logging.info("==== Start testing ====")
 
             cache_test = join(args.cache_dir, "cache_test")
-            test_lats = [None] * len(args.test_lat_ark) if len(args.test_lats) == 0 else args.test_lats
-            test_lat_ark = [None] * len(args.test_lats) if len(args.test_lat_ark) == 0 else args.test_lat_ark
+            test_lat = [None] * len(args.test_lat_ark) if len(args.test_lat) == 0 else args.test_lat
+            test_lat_ark = [None] * len(args.test_lat) if len(args.test_lat_ark) == 0 else args.test_lat_ark
 
-            for _lats, _lat_ark in zip(test_lats, test_lat_ark):
-                testset = LatticeTextDataset(lattice_pattern=_lats, lattice_ark_pattern=_lat_ark,
-                                             text_pattern=args.test_text, cache_dir=cache_test, process_cfg=process_cfg)
+            for _lat, _lat_ark in zip(test_lat, test_lat_ark):
+                testset = LatticeTextDataset(lattice_pattern=_lat, lattice_ark_pattern=_lat_ark,
+                                             text_pattern=args.test_text, cache_dir=cache_test,
+                                             process_cfg=process_cfg_for_test)
                 collate_fn = testset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
                 test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,
                                          num_workers=args.num_workers, collate_fn=collate_fn)
-
                 evaluate(encoder=encoder, tokenizer=tokenizer, dataloader=test_loader, args=args)
 
         except FileNotFoundError:

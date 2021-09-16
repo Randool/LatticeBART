@@ -186,6 +186,11 @@ class LatticeBart(BartPretrainedModel):
     def from_bart(cls, bart_path: str, depth_clip: int, lat_enc_layers: int):
         bart = BartForConditionalGeneration.from_pretrained(bart_path)
         config = bart.config.to_dict()
+
+        assert bart.config.encoder_layers >= lat_enc_layers, \
+            f"lat_enc_layers({lat_enc_layers}) larger than " \
+            f"bart.config.encoder_layers({bart.config.encoder_layers})"
+
         config["depth_clip"] = depth_clip
         config["lat_enc_layers"] = lat_enc_layers
         lattice_bart = cls(LatticeBartConfig.from_dict(config))
@@ -196,9 +201,21 @@ class LatticeBart(BartPretrainedModel):
         # Offset Lattice Encoder's layers
         for i in range(bart.config.encoder_layers):
             if i < lat_enc_layers:
+                """
+                Apply replacements
+                    layers => lattice_layers
+                    self_attn => lattice_self_attn 
+                on:
+                    model.encoder.layers.\d+.self_attn.[kqv]_proj.(weight|bias)
+                    model.encoder.layers.\d+.self_attn_layer_norm.(weight|bias)
+                    model.encoder.layers.\d+.fc1.(weight|bias)
+                """
                 prefix = f"model.encoder.layers.{i}"
                 for key in list(params.keys()):
                     if key.startswith(prefix):
+                        new_key = key.replace(".layers.", ".lattice_layers.")\
+                                     .replace(".self_attn.", ".lattice_self_attn.")
+                        params[new_key] = params[key]
                         del params[key]
             else:
                 prefix1 = f"model.encoder.layers.{i}"
@@ -217,7 +234,7 @@ class LatticeBart(BartPretrainedModel):
                 logging.debug(f"[x] {key}\t shape mismatch between bart and lattice bart")
                 continue
             param.data = params[key].data
-            logging.debug(f"[v] {key}")
+            # logging.debug(f"[v] {key}")
 
         return lattice_bart
 

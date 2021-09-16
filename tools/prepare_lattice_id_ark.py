@@ -4,6 +4,7 @@
 import argparse
 import glob
 import logging
+from os.path import realpath
 
 
 def parse_args():
@@ -54,6 +55,7 @@ def main():
 
     for i, file in enumerate(files, start=1):
         logging.info(f"[{i} / {len(files)}] {file}")
+        file = realpath(file)
         read_file(file, id_map, args.min_nodes, args.max_nodes)
 
     with open(args.output, "w", encoding="utf8") as f:

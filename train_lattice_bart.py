@@ -6,8 +6,8 @@ import logging
 import time
 from inspect import signature
 from math import ceil, floor
-from os.path import exists, dirname
-from typing import Union
+from os.path import exists
+from typing import Union, List
 
 import torch.nn as nn
 from torch.utils.data.dataloader import DataLoader
@@ -26,7 +26,7 @@ from utils.metric import WER, BLEU
 from utils.utils import set_seed, set_logger, RuntimeMetric
 
 
-def parse_args_and_setup_hyper_param() -> Namespace:
+def parse_args_and_setup_hyper_param(_args: List[str] = None) -> Namespace:
     psr = argparse.ArgumentParser()
     add_args_for_model_construct(psr)
     add_args_for_lr(psr)
@@ -35,7 +35,7 @@ def parse_args_and_setup_hyper_param() -> Namespace:
     add_args_for_train_procedure(psr)
     add_args_for_seq2seq_train(psr)
     add_args_for_seq2seq_generation(psr)
-    args = psr.parse_args()
+    args = psr.parse_args(_args)
 
     for key, val in list(vars(args).items()):
         if val is None:
@@ -52,11 +52,11 @@ def parse_args_and_setup_hyper_param() -> Namespace:
 
 
 def get_model_and_tokenizer(args: Namespace):
-    if args.checkpoint is not None:
-        args.checkpoint = join(args.exp_dir, args.checkpoint)
-        model = LatticeBart.from_pretrained(args.checkpoint)
+    ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric)
+    if ckpt_dir is not None:
+        model = LatticeBart.from_pretrained(ckpt_dir)
         tokenizer = BartTokenizer.from_pretrained(args.exp_dir)
-        logging.info(f"Load checkpoint from '{args.checkpoint}'")
+        logging.info(f"Load checkpoint from '{ckpt_dir}'")
     else:
         if args.default_config is not None:
             model = LatticeBart(get_model_config(args.default_config))
@@ -251,8 +251,8 @@ def train(model: LatticeBart, tokenizer: BartTokenizer, train_loader: DataLoader
         )
         metric = metrics[args.use_metric]
         if mtc.best_metrics is None or \
-                (mtc.best_metrics < metric and args.use_metric in ("bleu",)) or \
-                (mtc.best_metrics > metric and args.use_metric in ("cer", "wer", "loss")):
+                (mtc.best_metrics <= metric and args.use_metric in ("bleu",)) or \
+                (mtc.best_metrics >= metric and args.use_metric in ("cer", "wer", "loss")):
             mtc.best_metrics = metric
 
             _m = model.module if isinstance(model, nn.DataParallel) else model
@@ -264,8 +264,8 @@ def train(model: LatticeBart, tokenizer: BartTokenizer, train_loader: DataLoader
             break
 
 
-def main():
-    args = parse_args_and_setup_hyper_param()
+def main(_args: List[str] = None):
+    args = parse_args_and_setup_hyper_param(_args)
 
     #########################
     ######## Dataset ########
@@ -274,22 +274,28 @@ def main():
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
         use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
-        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask
+        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
+        homophone_replace=args.homophone_replace
+    )
+    process_cfg_for_test = DataProcessCfg(
+        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
+        lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
+        use_lattice_mask=1, binary_mask=1, homophone_replace=0
     )
 
     trainset = devset = None
 
-    if not (args.train_lats is None and args.train_lat_ark is None) and args.train_text is not None:
-        trainset = LatticeTextDataset(lattice_pattern=args.train_lats,
+    if not (args.train_lat is None and args.train_lat_ark is None) and args.train_text is not None:
+        trainset = LatticeTextDataset(lattice_pattern=args.train_lat,
                                       lattice_ark_pattern=args.train_lat_ark,
                                       text_pattern=args.train_text,
                                       process_cfg=process_cfg)
 
-    if not (args.eval_lats is None and args.eval_lat_ark is None) and args.eval_text is not None:
-        devset = LatticeTextDataset(lattice_pattern=args.eval_lats,
+    if not (args.eval_lat is None and args.eval_lat_ark is None) and args.eval_text is not None:
+        devset = LatticeTextDataset(lattice_pattern=args.eval_lat,
                                     lattice_ark_pattern=args.eval_lat_ark,
                                     text_pattern=args.eval_text,
-                                    process_cfg=process_cfg)
+                                    process_cfg=process_cfg_for_test)
 
     #######################
     ######## Train ########
@@ -325,20 +331,27 @@ def main():
         ####################
         ### Fast Forward ###
         ####################
-        if args.checkpoint:
-            epoch_trained = int(dirname(args.checkpoint).split("_")[-1])
+        ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric)
+        if ckpt_dir is not None:
+            epoch_trained = int(re.match(r".*epoch_(?P<n>\d+).*", ckpt_dir).group("n"))
             step_trained = ceil(epoch_trained * len(trainset) / (args.train_batch * args.grad_acc_steps))
 
-            optimizer.load_state_dict(torch.load(join(args.checkpoint, "optim.pt")))
+            optimizer.load_state_dict(torch.load(join(ckpt_dir, "optim.pt"), map_location=args.device))
+            # It seems that moving params to cuda manually can be effect?
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(args.device)
 
-            for i in range(step_trained):
+            for _ in range(step_trained):
                 scheduler.step()
 
             for i in range(epoch_trained):
                 for _ in train_loader:
                     break
+                logging.info(f"Pass epoch {i + 1}")
 
-            mtc = RuntimeMetric.load(join(args.checkpoint, "runtime_metric.json"))
+            mtc = RuntimeMetric.load(join(ckpt_dir, "runtime_metric.json"))
 
         try:
             train(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, args=args,
@@ -354,12 +367,12 @@ def main():
     if exp_dir is None:
         logging.error("No checkpoints found.")
     else:
-        if len(args.test_lats) == 0 and len(args.test_lat_ark) == 0:
+        if len(args.test_lat) == 0 and len(args.test_lat_ark) == 0:
             logging.error("No test data found.")
             return
-        if len(args.test_lats) > 0 and len(args.test_lat_ark) > 0:
-            logging.error(f"Only one `--test_lats` and `--test_lat_ark` of can be set. "
-                          f"Got: test_lats: {args.test_lats}, test_lat_ark: {args.test_lat_ark}")
+        if len(args.test_lat) > 0 and len(args.test_lat_ark) > 0:
+            logging.error(f"Only one `--test_lat` and `--test_lat_ark` of can be set. "
+                          f"Got: test_lat: {args.test_lat}, test_lat_ark: {args.test_lat_ark}")
             return
         try:
             # Loading model
@@ -373,12 +386,12 @@ def main():
             # Testing
             logging.info("==== Start testing ====")
 
-            test_lats = [None] * len(args.test_lat_ark) if len(args.test_lats) == 0 else args.test_lats
-            test_lat_ark = [None] * len(args.test_lats) if len(args.test_lat_ark) == 0 else args.test_lat_ark
+            test_lat = [None] * len(args.test_lat_ark) if len(args.test_lat) == 0 else args.test_lat
+            test_lat_ark = [None] * len(args.test_lat) if len(args.test_lat_ark) == 0 else args.test_lat_ark
 
-            for i, (_lats, _lat_ark) in enumerate(zip(test_lats, test_lat_ark)):
-                testset = LatticeTextDataset(lattice_pattern=_lats, lattice_ark_pattern=_lat_ark,
-                                             text_pattern=args.test_text, process_cfg=process_cfg)
+            for i, (_lat, _lat_ark) in enumerate(zip(test_lat, test_lat_ark)):
+                testset = LatticeTextDataset(lattice_pattern=_lat, lattice_ark_pattern=_lat_ark,
+                                             text_pattern=args.test_text, process_cfg=process_cfg_for_test)
                 test_loader = DataLoader(
                     testset, batch_size=args.eval_batch, shuffle=False, num_workers=args.num_workers,
                     collate_fn=testset.partial_collate_fn(tokenizer, n_lat=1, return_keys=True)

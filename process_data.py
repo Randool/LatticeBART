@@ -20,26 +20,27 @@ def main():
     ######## Dataset ########
     process_cfg = DataProcessCfg(
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
-        lm_scale=args.lm_scale, use_marginal=args.use_marginal == 1, use_min_depth=args.use_min_depth == 1,
-        use_max_depth=args.use_max_depth == 1, use_forward_backward=args.use_forward_backward == 1,
-        use_lattice_mask=args.use_lattice_mask == 1, binary_mask=args.use_binary_mask == 1
+        lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
+        use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
+        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
+        homophone_replace=args.homophone_replace
     )
 
-    if (args.train_lats is not None) or (args.train_text is not None):
+    if (args.train_lat is not None) or (args.train_text is not None):
         cache_train = join(args.cache_dir, "cache_train")
-        trainset = LatticeTextDataset(lattice_pattern=args.train_lats, text_pattern=args.train_text,
+        trainset = LatticeTextDataset(lattice_pattern=args.train_lat, text_pattern=args.train_text,
                                       cache_dir=cache_train, process_cfg=process_cfg)
         print(trainset)
 
     if (args.eval_lats is not None) or (args.eval_text is not None):
         cache_dev = join(args.cache_dir, "cache_dev")
-        devset = LatticeTextDataset(lattice_pattern=args.eval_lats, text_pattern=args.eval_text,
+        devset = LatticeTextDataset(lattice_pattern=args.eval_lat, text_pattern=args.eval_text,
                                     cache_dir=cache_dev, process_cfg=process_cfg)
         print(devset)
 
-    if (args.test_lats is not None) and (args.test_text is not None):
+    if (args.test_lat is not None) and (args.test_text is not None):
         cache_test = join(args.cache_dir, "cache_test")
-        testset = LatticeTextDataset(lattice_pattern=args.test_lats, text_pattern=args.test_text,
+        testset = LatticeTextDataset(lattice_pattern=args.test_lat, text_pattern=args.test_text,
                                      cache_dir=cache_test, process_cfg=process_cfg)
         print(testset)
 
