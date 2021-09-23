@@ -8,7 +8,6 @@
   ],
   "attention_dropout": 0.1,
   "bos_token_id": 0,
-  "classif_dropout": 0.1,
   "classifier_dropout": 0.0,
   "d_model": 1024,
   "decoder_attention_heads": 16,
@@ -69,5 +68,5 @@
   "transformers_version": "4.7.0.dev0",
   "use_cache": true,
   "vocab_size": 50265,
-  "depth_clip": 200
+  "phone_embed": "none"
 }

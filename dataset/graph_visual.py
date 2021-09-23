@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import networkx as nx
 
-from dataset.dataset import min_max_depth
+from dataset.parse import min_max_depth
 
 
 def _lattice_layout(G: nx.DiGraph):

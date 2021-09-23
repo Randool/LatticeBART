@@ -2,28 +2,34 @@
 Training pipeline of LatticeBart
 """
 import argparse
-import logging
-import time
 from inspect import signature
+from logging import Logger
 from math import ceil, floor
 from os.path import exists
 from typing import Union, List
 
+import torch.cuda
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
-from torch.utils.data.dataloader import DataLoader
+from torch.distributed import ReduceOp
+from torch.nn import DataParallel as DP
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from transformers import BartTokenizer, get_cosine_schedule_with_warmup
 
-from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg
+from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, CollateFn
 from models.config import get_model_config, get_tokenizer
 from models.encoder import LatticeEncoder
 from models.lattice_bart import LatticeBart
-from models.utils import model_init
+from models.model_utils import model_init
 from train_lattice_encoder import save_checkpoint, select_best_checkpoint, cos_similarity_mtx, contrastive_loss, \
-    config_optimizer
+    config_optimizer, wrap_distributed_parallel, load_phone_embed
 from utils.args import *
 from utils.metric import WER, BLEU
-from utils.utils import set_seed, set_logger, RuntimeMetric
+from utils.utils import set_seed, RuntimeMetric, use_DP, use_DDP, setup_dist_environment, \
+    cleanup_dist_environment, get_free_port, get_logger, show_args
 
 
 def parse_args_and_setup_hyper_param(_args: List[str] = None) -> Namespace:
@@ -45,57 +51,113 @@ def parse_args_and_setup_hyper_param(_args: List[str] = None) -> Namespace:
 
     config_exp_dir(args)
 
-    set_seed(args.seed)
-    set_logger(args)
-
     return args
 
 
-def get_model_and_tokenizer(args: Namespace):
-    ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric)
+def prepare_datasets(args: Namespace, logger: Logger):
+    process_cfg = DataProcessCfg(
+        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
+        lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
+        use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
+        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
+        homophone_replace=args.homophone_replace
+    )
+    process_cfg_for_test = DataProcessCfg(
+        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
+        lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
+        use_lattice_mask=1, binary_mask=1, homophone_replace=0
+    )
+
+    trainset, devset, testsets = None, None, []
+
+    if not (args.train_lat is None and args.train_lat_ark is None) and (args.train_text is not None):
+        trainset = LatticeTextDataset(lattice_pattern=args.train_lat,
+                                      lattice_ark_pattern=args.train_lat_ark,
+                                      text_pattern=args.train_text,
+                                      process_cfg=process_cfg)
+
+    if not (args.eval_lat is None and args.eval_lat_ark is None) and (args.eval_text is not None):
+        devset = LatticeTextDataset(lattice_pattern=args.eval_lat,
+                                    lattice_ark_pattern=args.eval_lat_ark,
+                                    text_pattern=args.eval_text,
+                                    process_cfg=process_cfg_for_test)
+
+    if len(args.test_lat) == 0 and len(args.test_lat_ark) == 0:
+        if logger:
+            logger.error("No test data found.")
+
+    if len(args.test_lat) > 0 and len(args.test_lat_ark) > 0:
+        raise ValueError(f"Only one of `--test_lat` and `--test_lat_ark` of can be set. "
+                         f"Got: test_lat: {args.test_lat}, test_lat_ark: {args.test_lat_ark}")
+
+    test_lat = [None] * len(args.test_lat_ark) if len(args.test_lat) == 0 else args.test_lat
+    test_lat_ark = [None] * len(args.test_lat) if len(args.test_lat_ark) == 0 else args.test_lat_ark
+
+    for i, (_lat, _lat_ark) in enumerate(zip(test_lat, test_lat_ark)):
+        testset = LatticeTextDataset(lattice_pattern=_lat, lattice_ark_pattern=_lat_ark, text_pattern=args.test_text,
+                                     process_cfg=process_cfg_for_test)
+        testsets.append(testset)
+
+    return trainset, devset, testsets
+
+
+def get_model_and_tokenizer(args: Namespace, logger: Logger, to_device):
+    ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric, logger=logger)
     if ckpt_dir is not None:
         model = LatticeBart.from_pretrained(ckpt_dir)
         tokenizer = BartTokenizer.from_pretrained(args.exp_dir)
-        logging.info(f"Load checkpoint from '{ckpt_dir}'")
+        if logger:
+            logger.info(f"Load checkpoint from '{ckpt_dir}'")
     else:
         if args.default_config is not None:
             model = LatticeBart(get_model_config(args.default_config))
             tokenizer = get_tokenizer()
+
         elif args.bart_path is not None:
-            model = LatticeBart.from_bart(bart_path=args.bart_path, depth_clip=args.depth_clip,
-                                          lat_enc_layers=args.lat_enc_layers)
+            model = LatticeBart.from_bart(
+                bart_path=args.bart_path, lat_enc_layers=args.lat_enc_layers, phone_embed=args.phone_embed
+            )
             tokenizer = BartTokenizer.from_pretrained(args.bart_path)
+
         elif args.lat_bart_path is not None:
             model = LatticeBart.from_pretrained(args.lat_bart_path)
             tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
+
         else:
-            logging.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
+            if logger:
+                logger.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
             raise ValueError("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
 
+        # Load pretrained phoneme embedding
+        if args.phone_embed != "none" and os.path.exists(args.phone_embed_path):
+            phone_embed = load_phone_embed(config=model.config, args=args, logger=logger)
+            model.get_encoder().phone_embed.weight.data = phone_embed.to(model.device)
+
+        # DDP will guarantee that parameters on different devices are the same! So please feel free to init it
         if args.init_model:
-            logging.info("[!] Initialize model parameters.")
-            model_init(model, std=model.config.init_std, except_modules=(model.get_encoder().embed_tokens,))
+            if logger:
+                logger.info("[!] Initialize model parameters.")
+            model_init(model, std=model.config.init_std, logger=logger,
+                       except_modules=(model.get_encoder().embed_tokens, model.get_encoder().phone_embed))
 
         if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
-            best_ckpt = select_best_checkpoint(args.lat_encoder, "loss")
+            best_ckpt = select_best_checkpoint(args.lat_encoder, use_metric="loss", logger=logger)
             model.get_encoder().load_state_dict(
                 torch.load(join(best_ckpt, LatticeEncoder.MODEL_PT), map_location=lambda st, loc: st)
             )
-            logging.info(f"Load pretrained LatticeEncoder from '{best_ckpt}'")
+            if logger:
+                logger.info(f"Load pretrained LatticeEncoder from '{best_ckpt}'")
 
-    # If you have multiple GPUs, why not use them?
-    if "cuda" in args.device and torch.cuda.device_count() > 1:
-        logging.info(f"Found {torch.cuda.device_count()} GPUs, using distributed training")
-        model = nn.DataParallel(model)
-
+    model.to(to_device)
     return model, tokenizer
 
 
-def evaluate(model: Union[LatticeBart, nn.DataParallel], tokenizer: BartTokenizer, dataloader: DataLoader,
-             args: Namespace, save_to: str = None) -> dict:
+def evaluate(model: Union[LatticeBart, DP], tokenizer: BartTokenizer, dataloader: DataLoader,
+             args: Namespace, logger: Logger, save_to: str = None) -> dict:
     """ Calculate BLEU, CER, WER """
     _state = model.training
     model.eval()
+    device = model.device if isinstance(model, LatticeBart) else model.module.device
 
     refers, hypos = [], []
     keys = []
@@ -112,8 +174,8 @@ def evaluate(model: Union[LatticeBart, nn.DataParallel], tokenizer: BartTokenize
         batch_refers = tokenizer.batch_decode(labels, skip_special_tokens=True)
         refers.extend(batch_refers)
 
-        inputs = dict_to_device(inputs, args.device)
-        if isinstance(model, nn.DataParallel):
+        inputs = dict_to_device(inputs, device)
+        if isinstance(model, DP):
             outputs = model.module.generate(**inputs, max_length=args.max_len, min_length=args.min_len,
                                             num_beams=args.num_beams)
         else:
@@ -125,7 +187,7 @@ def evaluate(model: Union[LatticeBart, nn.DataParallel], tokenizer: BartTokenize
     word_refers = [s.split() for s in refers]
     word_hypos = [s.split() for s in hypos]
     bleu = BLEU(word_refers, word_hypos)
-    wer = WER(word_refers, word_hypos, is_wer=True)
+    wer = WER(word_refers, word_hypos, is_wer=True, logger=logger)
 
     if save_to is not None:
         with open(join(args.exp_dir, save_to), "w", encoding="utf8") as f:
@@ -138,21 +200,25 @@ def evaluate(model: Union[LatticeBart, nn.DataParallel], tokenizer: BartTokenize
 
     char_refers = [list(s) for s in refers]
     char_hypos = [list(s) for s in hypos]
-    cer = WER(char_refers, char_hypos, is_wer=False)
+    cer = WER(char_refers, char_hypos, is_wer=False, logger=logger)
 
     if _state:
         model.train()
 
-    logging.info(f"Eval | BLEU: {bleu:.3f}")
+    if logger:
+        logger.info(f"Eval | BLEU: {bleu:.3f}")
+    else:
+        print(f"Eval | BLEU: {bleu:.3f}")
+
     return {"bleu": bleu, "wer": wer, "cer": cer}
 
 
-def model_forward(model: Union[LatticeBart, nn.DataParallel], inputs: dict, eos_id: int, args: Namespace) -> dict:
+def model_forward(model: Union[LatticeBart, DP, DDP], inputs: dict, eos_id: int, args: Namespace) -> dict:
     if args.contrast_method == "dropout":
         eos_pos = torch.where(inputs["input_ids"].eq(eos_id))
 
         # Forward twice
-        if isinstance(model, nn.DataParallel):
+        if isinstance(model, (DP, DDP)):
             enc_param = signature(model.module.get_encoder().forward).parameters
             enc_inputs = {k: v for k, v in inputs.items() if k in enc_param}
 
@@ -179,7 +245,7 @@ def model_forward(model: Union[LatticeBart, nn.DataParallel], inputs: dict, eos_
 
     else:
         # Forward once
-        if isinstance(model, nn.DataParallel):
+        if isinstance(model, (DP, DDP)):
             outputs = model.forward(**inputs, reduction="none")
             nll_loss = outputs["loss"].mean()
         else:
@@ -198,44 +264,50 @@ def model_forward(model: Union[LatticeBart, nn.DataParallel], inputs: dict, eos_
             return {"loss": nll_loss, "nll": nll_loss}
 
 
-def train(model: LatticeBart, tokenizer: BartTokenizer, train_loader: DataLoader, dev_loader: DataLoader,
-          optimizer, scheduler, writer: SummaryWriter, args: Namespace, epoch_trained=1,
-          runtime_metric: RuntimeMetric = None):
-    # Model
-    model.to(args.device)
+def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train_loader: DataLoader,
+             dev_loader: DataLoader, optimizer, scheduler, args: Namespace, logger: Logger, epoch_trained=0,
+             runtime_metric: RuntimeMetric = None, writer: SummaryWriter = None):
+    is_DP, is_DDP = isinstance(model, DP), isinstance(model, DDP)
+    device = model.module.device if (is_DP or is_DDP) else model.device
+    early_stop = torch.tensor(0).to("cuda" if is_DDP else "cpu")
 
-    # Metrics
-    mtc = RuntimeMetric(None, window_size=10, patience=args.patience,
-                        decrease=(args.use_metric in ("cer", "wer", 'loss'))) if runtime_metric is None \
-        else runtime_metric
+    if is_DDP and dist.get_rank() != 0:
+        mtc = None
+    else:
+        # Metrics
+        mtc = RuntimeMetric(
+            None, window_size=10, patience=args.patience, decrease=(args.use_metric in ("cer", "wer", 'loss'))
+        ) if runtime_metric is None else runtime_metric
 
-    logging.info("==== Start training ====")
-    for epoch in range(epoch_trained, args.epoch + 1):
+    if logger:
+        logger.info("======== Start training ========")
+
+    for epoch in range(epoch_trained + 1, args.epoch + 1):
         model.train()
-
+        if isinstance(train_loader.sampler, DistributedSampler):
+            train_loader.sampler.set_epoch(epoch)
         max_steps = len(train_loader)
 
         for step, inputs in enumerate(train_loader, start=1):
-            inputs = dict_to_device(inputs, args.device)
+            inputs = dict_to_device(inputs, device)
             losses = model_forward(model, inputs, tokenizer.eos_token_id, args)
 
             loss = losses["loss"]
             loss.backward()
-            mtc.avg_loss.append(loss.item())
+            if mtc:
+                mtc.avg_loss.append(loss.item())
 
             global_step = len(train_loader) * (epoch - 1) + step
-            writer.add_scalars(
-                main_tag="loss",
-                tag_scalar_dict=losses,
-                global_step=global_step
-            )
+            # if writer is not None:
+            #     writer.add_scalars(main_tag="loss", tag_scalar_dict=losses, global_step=global_step)
 
-            if step % args.log_every == 0:
+            if logger and step % args.log_every == 0:
                 lrs = [f"{group['lr']:.2e}" for group in optimizer.param_groups]
                 lrs = [lrs[0], lrs[-1]] if len(lrs) > 2 else lrs
                 lrs = " ~ ".join(lrs)
-                logging.info(f"Ep {epoch} / {args.epoch} | st {step} / {max_steps} | lr: {lrs} | "
-                             f"avg loss: {mtc.avg_loss.avg_value:.2e}")
+                msg = f"Ep {epoch} / {args.epoch} | st {step} / {max_steps} | lr: {lrs} | " \
+                      f"avg loss: {mtc.avg_loss.avg_value:.2e}"
+                logger.info(msg)
 
             if global_step % args.grad_acc_steps == 0:
                 nn.utils.clip_grad_norm_(model.parameters(), args.clip)
@@ -244,171 +316,225 @@ def train(model: LatticeBart, tokenizer: BartTokenizer, train_loader: DataLoader
                 scheduler.step()
 
         # Evaluate after an epoch
-        metrics = evaluate(model, tokenizer, dev_loader, args)
-        writer.add_scalars(
-            main_tag="Metric", tag_scalar_dict=metrics,
-            global_step=len(train_loader) * epoch
-        )
-        metric = metrics[args.use_metric]
-        if mtc.best_metrics is None or \
-                (mtc.best_metrics <= metric and args.use_metric in ("bleu",)) or \
-                (mtc.best_metrics >= metric and args.use_metric in ("cer", "wer", "loss")):
-            mtc.best_metrics = metric
+        if mtc:
+            _model = model.module if (is_DP or is_DDP) else model
 
-            _m = model.module if isinstance(model, nn.DataParallel) else model
-            save_checkpoint(epoch=epoch, metric=metric, model=_m, optimizer=optimizer,
-                            tokenizer=tokenizer, runtime_metric=mtc, args=args)
+            metrics = evaluate(_model, tokenizer, dev_loader, args=args, logger=logger)
+            if writer is not None:
+                writer.add_scalars(main_tag="Metric", tag_scalar_dict=metrics, global_step=len(train_loader) * epoch)
 
-        if mtc.early_stop.stop(metric):
-            logging.info(f"Early stopping after {epoch} epoch.")
+            metric = metrics[args.use_metric]
+
+            if mtc.best_metrics is None or \
+                    (mtc.best_metrics <= metric and args.use_metric in ("bleu",)) or \
+                    (mtc.best_metrics >= metric and args.use_metric in ("cer", "wer", "loss")):
+                mtc.best_metrics = metric
+
+                save_checkpoint(epoch=epoch, model=_model, metric=metric, optimizer=optimizer,
+                                tokenizer=tokenizer, runtime_metric=mtc, args=args, logger=logger)
+        else:
+            metric = None
+
+        # If meet the requirement of early_stop (then inform other processes), then break the loop
+        if mtc and metric and mtc.early_stop.stop(metric):
+            early_stop.fill_(1)
+
+        if is_DDP:
+            dist.all_reduce(early_stop, ReduceOp.SUM)
+
+        if early_stop > 0:
+            if logger:
+                logger.info(f"Early stopping after {epoch} epoch.")
             break
+
+
+def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDataset, devset: LatticeTextDataset,
+          args: Namespace, logger: Logger = None):
+    if logger is None and rank == 0:
+        logger = get_logger(args, "LatticeBartTrain")
+
+    if trainset is None or len(trainset) == 0:
+        if logger:
+            logger.error("Empty trainset")
+        return
+
+    if devset is None or len(devset) == 0:
+        if logger:
+            logger.error("Empty devset")
+        return
+
+    if rank != -1:
+        setup_dist_environment(rank, world_size, master_port)
+
+    set_seed(args.seed)
+
+    _use_DP, _use_DDP = use_DP(args), use_DDP(args)
+
+    if _use_DDP:
+        device = f"cuda:{rank}"
+        model, tokenizer = get_model_and_tokenizer(args, logger, to_device=device)
+        batch_size = args.train_batch // world_size
+        num_workers = args.num_workers // world_size
+    else:
+        device = args.device
+        model, tokenizer = get_model_and_tokenizer(args, logger, to_device=device)
+        batch_size = args.train_batch
+        num_workers = args.num_workers
+
+    train_collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1),
+                                 phone_embed=args.phone_embed).collate_fn
+    dev_collate_fn = CollateFn(tokenizer=tokenizer, n_lat=1, phone_embed=args.phone_embed).collate_fn
+
+    train_loader = DataLoader(
+        trainset, batch_size=batch_size, num_workers=num_workers, shuffle=False if _use_DDP else True,
+        collate_fn=train_collate_fn, sampler=DistributedSampler(trainset, seed=args.seed) if _use_DDP else None
+    )
+    dev_loader = DataLoader(
+        devset, batch_size=args.eval_batch, num_workers=args.num_workers, collate_fn=dev_collate_fn
+    )
+
+    optimizer = config_optimizer(model, args)
+    total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
+    if logger:
+        logger.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=floor(total_steps * 0.01),
+        num_training_steps=floor(total_steps * 1.2)  # Prevent zero lr
+    )
+
+    mtc = RuntimeMetric(None, window_size=10, patience=args.patience,
+                        decrease=(args.use_metric in ("cer", "wer", "loss")))
+    epoch_trained = 0
+
+    ### Fast Forward ###
+    ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric, logger=logger)
+    if ckpt_dir is not None:
+        epoch_trained = int(re.match(r".*epoch_(?P<n>\d+).*", ckpt_dir).group("n"))
+        step_trained = ceil(epoch_trained * len(trainset) / (args.train_batch * args.grad_acc_steps))
+
+        optimizer.load_state_dict(torch.load(join(ckpt_dir, "optim.pt"), map_location=device))
+        # It seems that moving params to cuda manually can be effect?
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device)
+
+        for _ in range(step_trained):
+            scheduler.step()
+
+        for i in range(epoch_trained):
+            for _ in train_loader:
+                break
+            if logger:
+                logger.info(f"Pass epoch {i + 1}")
+
+        mtc = RuntimeMetric.load(join(ckpt_dir, "runtime_metric.json"))
+
+    if _use_DP or _use_DDP:
+        model = wrap_distributed_parallel(rank=rank, model=model, args=args, logger=logger)
+
+    try:
+        training(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, args=args,
+                 logger=logger, optimizer=optimizer, scheduler=scheduler, epoch_trained=epoch_trained,
+                 runtime_metric=mtc)
+    except KeyboardInterrupt:
+        if logger:
+            logger.info("Interrupt by user.")
+
+    if rank != -1:
+        cleanup_dist_environment()
+
+
+def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
+    if len(testsets) == 0:
+        logger.error("No test data found.")
+        return
+
+    set_seed(args.seed)
+
+    exp_dir = select_best_checkpoint(args.exp_dir, args.use_metric, logger=logger)
+    if exp_dir is None:
+        logger.error("No checkpoints found.")
+        return
+
+    try:
+        # Loading model
+        model = LatticeBart.from_pretrained(exp_dir).to(args.device).eval()
+        tokenizer = BartTokenizer.from_pretrained(args.exp_dir)
+
+        if use_DP(args):
+            model = wrap_distributed_parallel(rank=-1, model=model, args=args, logger=logger)
+
+        # Testing
+        logger.info("======== Start testing ========")
+
+        test_collate_fn = CollateFn(tokenizer, n_lat=1, return_keys=True, phone_embed=args.phone_embed).collate_fn
+
+        for i, testset in enumerate(testsets):
+            test_loader = DataLoader(
+                testset, batch_size=args.eval_batch, num_workers=args.num_workers, collate_fn=test_collate_fn
+            )
+            evaluate(model, tokenizer, dataloader=test_loader, args=args, logger=logger, save_to=f"hypo_{i}.txt")
+
+    except FileNotFoundError:
+        logger.error("FileNotFoundError!")
+
+        config_file = join(exp_dir, "config.json")
+        pt_file = join(exp_dir, LatticeBart.MODEL_PT)
+
+        if not exists(config_file):
+            logger.error(f"config_file: `{config_file}` not found")
+        if not exists(pt_file):
+            logger.error(f"pt_file: `{pt_file}` not found")
 
 
 def main(_args: List[str] = None):
     args = parse_args_and_setup_hyper_param(_args)
+    os.makedirs(args.exp_dir, exist_ok=True)
 
-    #########################
-    ######## Dataset ########
-    #########################
-    process_cfg = DataProcessCfg(
-        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
-        lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
-        use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
-        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
-        homophone_replace=args.homophone_replace
-    )
-    process_cfg_for_test = DataProcessCfg(
-        min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
-        lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
-        use_lattice_mask=1, binary_mask=1, homophone_replace=0
-    )
+    logger = get_logger(args, "LatticeBartMain")
+    show_args(args, logger)
 
-    trainset = devset = None
+    # writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
 
-    if not (args.train_lat is None and args.train_lat_ark is None) and args.train_text is not None:
-        trainset = LatticeTextDataset(lattice_pattern=args.train_lat,
-                                      lattice_ark_pattern=args.train_lat_ark,
-                                      text_pattern=args.train_text,
-                                      process_cfg=process_cfg)
+    trainset, devset, testsets = prepare_datasets(args, logger)
+    train_phase = test_phase = True
 
-    if not (args.eval_lat is None and args.eval_lat_ark is None) and args.eval_text is not None:
-        devset = LatticeTextDataset(lattice_pattern=args.eval_lat,
-                                    lattice_ark_pattern=args.eval_lat_ark,
-                                    text_pattern=args.eval_text,
-                                    process_cfg=process_cfg_for_test)
-
-    #######################
-    ######## Train ########
-    #######################
     if trainset is None or len(trainset) == 0:
-        logging.info("No valid training data. Training phase is passed.")
-    elif devset is None or len(devset) == 0:
-        logging.info("No valid validation data. Training phase is passed.")
+        logger.info("Trainset: \t0 items")
+        train_phase = False
     else:
-        model, tokenizer = get_model_and_tokenizer(args)
+        logger.info(f"Trainset: \t{len(trainset)} items")
 
-        train_loader = DataLoader(
-            trainset, batch_size=args.train_batch, shuffle=True, num_workers=args.num_workers,
-            collate_fn=trainset.partial_collate_fn(tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1))
-        )
-        dev_loader = DataLoader(devset, batch_size=args.eval_batch, shuffle=False, num_workers=args.num_workers,
-                                collate_fn=devset.partial_collate_fn(tokenizer))
-
-        optimizer = config_optimizer(model, args)
-        total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
-        logging.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=floor(total_steps * 0.01),
-            num_training_steps=total_steps
-        )
-
-        mtc = RuntimeMetric(None, window_size=10, patience=args.patience,
-                            decrease=(args.use_metric in ("cer", "wer", "loss")))
-        epoch_trained = 1
-        writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
-
-        ####################
-        ### Fast Forward ###
-        ####################
-        ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric)
-        if ckpt_dir is not None:
-            epoch_trained = int(re.match(r".*epoch_(?P<n>\d+).*", ckpt_dir).group("n"))
-            step_trained = ceil(epoch_trained * len(trainset) / (args.train_batch * args.grad_acc_steps))
-
-            optimizer.load_state_dict(torch.load(join(ckpt_dir, "optim.pt"), map_location=args.device))
-            # It seems that moving params to cuda manually can be effect?
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        state[k] = v.to(args.device)
-
-            for _ in range(step_trained):
-                scheduler.step()
-
-            for i in range(epoch_trained):
-                for _ in train_loader:
-                    break
-                logging.info(f"Pass epoch {i + 1}")
-
-            mtc = RuntimeMetric.load(join(ckpt_dir, "runtime_metric.json"))
-
-        try:
-            train(model=model, tokenizer=tokenizer, train_loader=train_loader, dev_loader=dev_loader, args=args,
-                  writer=writer, optimizer=optimizer, scheduler=scheduler, epoch_trained=epoch_trained,
-                  runtime_metric=mtc)
-        except KeyboardInterrupt:
-            logging.info("Interrupt by user.")
-
-    ##############
-    #### Test ####
-    ##############
-    exp_dir = select_best_checkpoint(args.exp_dir, args.use_metric)
-    if exp_dir is None:
-        logging.error("No checkpoints found.")
+    if devset is None or len(devset) == 0:
+        logger.info("Devset:\t0 items")
+        train_phase = False
     else:
-        if len(args.test_lat) == 0 and len(args.test_lat_ark) == 0:
-            logging.error("No test data found.")
-            return
-        if len(args.test_lat) > 0 and len(args.test_lat_ark) > 0:
-            logging.error(f"Only one `--test_lat` and `--test_lat_ark` of can be set. "
-                          f"Got: test_lat: {args.test_lat}, test_lat_ark: {args.test_lat_ark}")
-            return
-        try:
-            # Loading model
-            model = LatticeBart.from_pretrained(exp_dir).to(args.device).eval()
-            tokenizer = BartTokenizer.from_pretrained(args.exp_dir)
+        logger.info(f"Devset: \t{len(devset)} items")
 
-            if "cuda" in args.device and torch.cuda.device_count() > 1:
-                logging.info(f"Found {torch.cuda.device_count()} GPUs, using distributed training")
-                model = nn.DataParallel(model)
+    if len(testsets) == 0:
+        logger.info("Testset: \t0 items")
+        test_phase = False
+    else:
+        for i, testset in enumerate(testsets):
+            logger.info(f"Testset {i}: \t{len(testset)} items")
 
-            # Testing
-            logging.info("==== Start testing ====")
+    if train_phase:
+        if use_DDP(args):
+            world_size = torch.cuda.device_count()
+            logger.info(f"word_size: {world_size}")
+            port = get_free_port()
+            mp.spawn(train, args=(world_size, port, trainset, devset, args, None), nprocs=world_size, join=True)
+        else:
+            train(rank=-1, world_size=-1, master_port=-1, trainset=trainset, devset=devset, args=args, logger=logger)
+    else:
+        logger.info("Training phase is passed.")
 
-            test_lat = [None] * len(args.test_lat_ark) if len(args.test_lat) == 0 else args.test_lat
-            test_lat_ark = [None] * len(args.test_lat) if len(args.test_lat_ark) == 0 else args.test_lat_ark
-
-            for i, (_lat, _lat_ark) in enumerate(zip(test_lat, test_lat_ark)):
-                testset = LatticeTextDataset(lattice_pattern=_lat, lattice_ark_pattern=_lat_ark,
-                                             text_pattern=args.test_text, process_cfg=process_cfg_for_test)
-                test_loader = DataLoader(
-                    testset, batch_size=args.eval_batch, shuffle=False, num_workers=args.num_workers,
-                    collate_fn=testset.partial_collate_fn(tokenizer, n_lat=1, return_keys=True)
-                )
-                save_to = f"hypo_{i}.txt"
-                evaluate(model=model, tokenizer=tokenizer, dataloader=test_loader, args=args, save_to=save_to)
-
-        except FileNotFoundError:
-            logging.error("FileNotFoundError!")
-
-            config_file = join(exp_dir, "config.json")
-            pt_file = join(exp_dir, LatticeBart.MODEL_PT)
-
-            if not exists(config_file):
-                logging.error(f"config_file: `{config_file}` not found")
-            if not exists(pt_file):
-                logging.error(f"pt_file: `{pt_file}` not found")
+    if test_phase:
+        test(testsets=testsets, args=args, logger=logger)
+    else:
+        logger.info("Testing phase is passed.")
 
 
 if __name__ == '__main__':

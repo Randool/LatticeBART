@@ -1,9 +1,9 @@
 import glob
-import logging
 import os
 import pickle
 import random
 from collections import namedtuple
+# from logging import Logger
 from os.path import exists, join, split
 from typing import Union, Dict, Any, List
 
@@ -14,7 +14,10 @@ from torch.utils.data.dataset import Dataset
 from transformers import BartTokenizer, BatchEncoding
 
 from dataset.parse import parse_lattice_file, line_graph_process, parse_lattice_from_address
-from utils.tokenizer import word_based_tokenize, HomophoneReplacer
+from utils.args import PHONE_EMBED_CHOICE
+from utils.phone import HomophoneReplacer
+from utils.tokenizer import word_based_tokenize
+# from utils.utils import log
 
 MAX_NODEs = int(1e3)
 
@@ -82,11 +85,11 @@ class _LatticeDataset(_KeyBased):
                 filename = join(cache_dir, f"{split(file)[-1]}.cache")
                 if exists(filename):
                     _lattices = _load_cache(filename)
-                    logging.info(f"Load {len(_lattices)} lattices from {filename}.")
+                    # log(f"Load {len(_lattices)} lattices from {filename}.", logger)
                 else:
                     _lattices = self._load_and_filter(file, min_nodes, max_nodes, lower_case, lm_scale, ac_scale)
                     _cache_data(_lattices, filename)
-                    logging.info(f"Cache {len(_lattices)} lattices to {filename}.")
+                    # log(f"Cache {len(_lattices)} lattices to {filename}.", logger)
             else:
                 _lattices = self._load_and_filter(file, min_nodes, max_nodes, lower_case, lm_scale, ac_scale)
 
@@ -101,7 +104,7 @@ class _LatticeDataset(_KeyBased):
         if len(self.items) == 0:
             raise RuntimeError("No lattice files found")
 
-        logging.info(f"{self.__class__.__name__}: {len(self.items)} lattice ids.")
+        # log(f"{self.__class__.__name__}: {len(self.items)} lattice ids.", logger)
 
     @staticmethod
     def _load_and_filter(file: str, min_nodes: int, max_nodes: int, lower_case: bool, lm_scale: float, ac_scale: float):
@@ -111,7 +114,7 @@ class _LatticeDataset(_KeyBased):
         for lattice_id, lat in list(_lattices.items()):
             if len(lat) < min_nodes or len(lat) > max_nodes:
                 del _lattices[lattice_id]
-        logging.info(f"Load {len(_lattices)} lattices from {file}.")
+        # logger.info(f"Load {len(_lattices)} lattices from {file}.")
         return _lattices
 
 
@@ -131,7 +134,7 @@ class _LatticeArkDataset(_KeyBased):
                     key, *items = line.split()
                     self.items[key] = items
 
-        logging.info(f"{self.__class__.__name__}: {len(self.items)} lattice ids.")
+        # log(f"{self.__class__.__name__}: {len(self.items)} lattice ids.", logger)
 
 
 class __TextDataset(_KeyBased):
@@ -150,9 +153,9 @@ class __TextDataset(_KeyBased):
             items = self._parse_text_file(file, lower_case=lower_case, token_split=token_split)
             for key, text in items:
                 self.items[key] = text
-            logging.info(f"Load {len(items)} texts from {file}.")
+            # log(f"Load {len(items)} texts from {file}.", logger)
 
-        logging.info(f"{self.__class__.__name__}: {len(self.items)} items.")
+        # log(f"{self.__class__.__name__}: {len(self.items)} items.", logger)
 
     @staticmethod
     def _parse_text_file(text_file: str, lower_case=True, token_split=True):
@@ -184,7 +187,7 @@ class _OracleDataset(__TextDataset):
         super().__init__(text_file_pattern, lower_case=lower_case, token_split=True)
 
 
-class _TextDataset(__TextDataset):
+class TextDataset(__TextDataset):
     def __init__(self, text_file_pattern: str, lower_case=True):
         super().__init__(text_file_pattern, lower_case=lower_case, token_split=False)
 
@@ -204,7 +207,7 @@ class LatticeTextDataset(Dataset):
     ):
         self.process_cfg = process_cfg
 
-        if lattice_pattern is None and lattice_ark_pattern is None:
+        if (lattice_pattern is None) and (lattice_ark_pattern is None):
             raise ValueError("One of --lattice_pattern or --lattice_ark should be given")
 
         if lattice_pattern is not None:
@@ -219,11 +222,11 @@ class LatticeTextDataset(Dataset):
         if text_pattern is None:
             self.items = [[key, lattices[key], None] for key in lattices.keys()]
         else:
-            transcripts = _TextDataset(text_pattern, lower_case=self.process_cfg.lower_case)
+            transcripts = TextDataset(text_pattern, lower_case=self.process_cfg.lower_case)
             common_keys = set(lattices.keys()) & set(transcripts.keys())
             self.items = [[key, lattices[key], transcripts[key]] for key in lattices.keys() if key in common_keys]
 
-        logging.info(f"{self.__class__.__name__}: {len(self)} items.")
+        # log(f"{self.__class__.__name__}: {len(self)} items.", logger)
 
     def __len__(self):
         return len(self.items)
@@ -245,114 +248,125 @@ class LatticeTextDataset(Dataset):
             random.shuffle(pairs)
             self.items[i:j] = pairs
 
-    def partial_collate_fn(self, tokenizer: BartTokenizer, n_lat=1, return_keys=False,
-                           process_cfg: DataProcessCfg = None):
-        if process_cfg is None:
-            process_cfg = self.process_cfg
 
-        homophone_replacer = HomophoneReplacer()
+class CollateFn:
+    def __init__(self, tokenizer: BartTokenizer, n_lat=1, return_keys=False, phone_embed="none",
+                 process_cfg: DataProcessCfg = _default_cfg):
+        assert phone_embed in PHONE_EMBED_CHOICE
 
-        def padding_seqs(seqs: list, pad, max_len, tensor_type):
-            for i, seq in enumerate(seqs):
-                seqs[i] = max_len * [pad] if (seq is None) else seq + (max_len - len(seq)) * [pad]
-            return torch.tensor(seqs, dtype=tensor_type)
+        self.tokenizer = tokenizer
+        self.n_lat = n_lat
+        self.return_keys = return_keys
+        self.phone_embed = phone_embed
+        self.process_cfg = process_cfg
 
-        def padding_mats(mats: list, pad, shape, tensor_type):
-            _mats = torch.zeros(len(mats), *shape, dtype=tensor_type).fill_(pad)
-            for i, mat in enumerate(mats):
-                if mat is None:
-                    continue
-                m, n = mat.shape
-                _mats[i, :m, :n] = mat
-            return _mats
+        self.homophone_replacer = HomophoneReplacer() if process_cfg.homophone_replace > 0 else None
 
-        def collate_fn(batch_data: list) -> dict:
-            keys = []
+    @staticmethod
+    def padding_seqs(seqs: list, pad, max_len, tensor_type):
+        for i, seq in enumerate(seqs):
+            seqs[i] = max_len * [pad] if (seq is None) else seq + (max_len - len(seq)) * [pad]
+        return torch.tensor(seqs, dtype=tensor_type)
 
-            batch_input_seqs = []
-            batch_min_depth = []
-            batch_max_depth = []
-            batch_lat_mask = []
-            batch_fb = []
-            batch_marginal = []
+    @staticmethod
+    def padding_mats(mats: list, pad, shape, tensor_type):
+        _mats = torch.zeros(len(mats), *shape, dtype=tensor_type).fill_(pad)
+        for i, mat in enumerate(mats):
+            if mat is None:
+                continue
+            m, n = mat.shape
+            _mats[i, :m, :n] = mat
+        return _mats
 
-            batch_texts = []
+    def collate_fn(self, batch_data: list) -> dict:
+        process_cfg = self.process_cfg
 
-            for key, lats, text in batch_data:
-                if return_keys:
-                    keys.append(key)
+        keys = []
 
-                idx = [i % len(lats) for i in range(max(len(lats), n_lat))]  # Padding lats if not enough
-                random.shuffle(idx)
-                idx = idx[:n_lat]
-                batch_texts.extend([text] * n_lat)
+        batch_input_seqs = []
+        batch_min_depth = []
+        batch_max_depth = []
+        batch_lat_mask = []
+        batch_fb = []
+        batch_marginal = []
 
-                # Process nx.Digraph-formatted lattice
-                for i in idx:
-                    lat = lats[i]
-                    if isinstance(lat, nx.DiGraph):
-                        lats[i] = lat = line_graph_process(
-                            lat, use_marginal=(random.random() <= process_cfg.use_marginal),
-                            min_depth=(random.random() <= process_cfg.use_min_depth),
-                            max_depth=(random.random() <= process_cfg.use_max_depth),
-                            forward_backward=(random.random() <= process_cfg.use_forward_backward),
-                            use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
-                            binary_mask=(random.random() <= process_cfg.binary_mask)
-                        )
-                    elif isinstance(lat, str):  # ark format: <file>:<bias>:<delta>
-                        lattice_id, lat = parse_lattice_from_address(lat, to_line_graph=True,
-                                                                     lower_case=process_cfg.lower_case,
-                                                                     lm_scale=process_cfg.lm_scale,
-                                                                     ac_scale=process_cfg.ac_scale)
+        batch_texts = []
 
-                        # `key.startswith(lattice_id)` is used when do contrastive learning
-                        assert lattice_id == key or key.startswith(lattice_id), \
-                            f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
+        for key, lats, text in batch_data:
+            if self.return_keys:
+                keys.append(key)
 
-                        lat = line_graph_process(
-                            lat, use_marginal=(random.random() <= process_cfg.use_marginal),
-                            min_depth=(random.random() <= process_cfg.use_min_depth),
-                            max_depth=(random.random() <= process_cfg.use_max_depth),
-                            forward_backward=(random.random() <= process_cfg.use_forward_backward),
-                            use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
-                            binary_mask=(random.random() <= process_cfg.binary_mask)
-                        )
+            idx = [i % len(lats) for i in range(max(len(lats), self.n_lat))]  # Padding lats if not enough
+            random.shuffle(idx)
+            idx = idx[:self.n_lat]
+            batch_texts.extend([text] * self.n_lat)
 
-                    input_text, marginal, min_depth, max_depth, fb, lattice_mask = lat
-                    batch_input_seqs.append(input_text)
-                    batch_min_depth.append(min_depth)
-                    batch_max_depth.append(max_depth)
-                    batch_lat_mask.append(lattice_mask)
-                    batch_fb.append(fb)
-                    batch_marginal.append(marginal)
+            # Process nx.Digraph-formatted lattice
+            for i in idx:
+                lat = lats[i]
+                if isinstance(lat, nx.DiGraph):
+                    lat = line_graph_process(
+                        lat, use_marginal=(random.random() <= process_cfg.use_marginal),
+                        min_depth=(random.random() <= process_cfg.use_min_depth),
+                        max_depth=(random.random() <= process_cfg.use_max_depth),
+                        forward_backward=(random.random() <= process_cfg.use_forward_backward),
+                        use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
+                        binary_mask=(random.random() <= process_cfg.binary_mask)
+                    )
+                elif isinstance(lat, str):  # ark format: <file>:<bias>:<delta>
+                    lattice_id, lat = parse_lattice_from_address(lat, to_line_graph=True,
+                                                                 lower_case=process_cfg.lower_case,
+                                                                 lm_scale=process_cfg.lm_scale,
+                                                                 ac_scale=process_cfg.ac_scale)
 
-            # Replace homophone
-            if process_cfg.homophone_replace > 0:
-                batch_input_seqs = [homophone_replacer.process_sent(s, ratio=process_cfg.homophone_replace) for s in
-                                    batch_input_seqs]
+                    # `key.startswith(lattice_id)` is used when do contrastive learning
+                    assert lattice_id == key or key.startswith(lattice_id), \
+                        f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
 
-            inputs = word_based_tokenize(batch_input_seqs, tokenizer, lower=True,
-                                         return_attention=False, to_tensor=True)
+                    lat = line_graph_process(
+                        lat, use_marginal=(random.random() <= process_cfg.use_marginal),
+                        min_depth=(random.random() <= process_cfg.use_min_depth),
+                        max_depth=(random.random() <= process_cfg.use_max_depth),
+                        forward_backward=(random.random() <= process_cfg.use_forward_backward),
+                        use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
+                        binary_mask=(random.random() <= process_cfg.binary_mask)
+                    )
 
-            if return_keys:
-                inputs["key"] = keys
+                input_text, marginal, min_depth, max_depth, fb, lattice_mask = lat
+                batch_input_seqs.append(input_text)
+                batch_min_depth.append(min_depth)
+                batch_max_depth.append(max_depth)
+                batch_lat_mask.append(lattice_mask)
+                batch_fb.append(fb)
+                batch_marginal.append(marginal)
 
-            B, max_len = inputs["input_ids"].shape
-            mat_shape = (max_len, max_len)
+        # Replace homophone
+        if self.homophone_replacer is not None:
+            batch_input_seqs = [
+                self.homophone_replacer.process_sent(s, ratio=process_cfg.homophone_replace) for s in
+                batch_input_seqs
+            ]
 
-            inputs["min_depth"] = padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long)
-            inputs["max_depth"] = padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long)
-            inputs["lattice_mask"] = padding_mats(batch_lat_mask, 0, mat_shape, torch.long)
-            inputs["marginals"] = padding_seqs(batch_marginal, 0, max_len, torch.float)
-            inputs["forward_backward"] = padding_mats(batch_fb, 0, mat_shape, torch.float)
-            inputs["batch_idx"] = torch.arange(B, dtype=torch.long)
+        inputs = word_based_tokenize(batch_input_seqs, self.tokenizer, lower=True, return_attention=False,
+                                     to_tensor=True, phone_embed=self.phone_embed)
 
-            if batch_texts[0] is not None:
-                outputs = tokenizer.batch_encode_plus(batch_texts, padding=True, return_tensors="pt")
-                inputs["decoder_input_ids"] = outputs["input_ids"][:, :-1].contiguous()
-                inputs["decoder_attention_mask"] = outputs["attention_mask"][:, :-1].contiguous()
-                inputs["labels"] = outputs["input_ids"][:, 1:].contiguous()
+        if self.return_keys:
+            inputs["key"] = keys
 
-            return inputs
+        B, max_len = inputs["input_ids"].shape
+        mat_shape = (max_len, max_len)
 
-        return collate_fn
+        inputs["min_depth"] = self.padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long)
+        inputs["max_depth"] = self.padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long)
+        inputs["lattice_mask"] = self.padding_mats(batch_lat_mask, 0, mat_shape, torch.long)
+        inputs["marginals"] = self.padding_seqs(batch_marginal, 0, max_len, torch.float)
+        inputs["forward_backward"] = self.padding_mats(batch_fb, 0, mat_shape, torch.float)
+        inputs["batch_idx"] = torch.arange(B, dtype=torch.long)
+
+        if batch_texts[0] is not None:
+            outputs = self.tokenizer.batch_encode_plus(batch_texts, padding=True, return_tensors="pt")
+            inputs["decoder_input_ids"] = outputs["input_ids"][:, :-1].contiguous()
+            inputs["decoder_attention_mask"] = outputs["attention_mask"][:, :-1].contiguous()
+            inputs["labels"] = outputs["input_ids"][:, 1:].contiguous()
+
+        return inputs

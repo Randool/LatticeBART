@@ -2,31 +2,60 @@ import json
 import logging
 import os
 import random
+import sys
 from argparse import Namespace
 from collections import namedtuple
+from logging import Logger
 from os.path import join
 from typing import List
 
 import numpy as np
 import torch
+import torch.distributed as dist
 
 
 def set_seed(seed):
-    torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
+#### Logging ####
+
+def show_args(args: Namespace, logger: Logger):
+    logger.info("=" * 30)
+    for _arg in vars(args):
+        logger.info(f"{_arg:20s}\t{getattr(args, _arg)}")
+    logger.info("=" * 30)
 
 
 def set_logger(args: Namespace):
     os.makedirs(args.exp_dir, exist_ok=True)
     logging.basicConfig(filename=join(args.exp_dir, "log.txt"), level=logging.INFO,
                         datefmt='%H:%M:%S', format='[%(asctime)s] %(levelname)s - %(message)s')
-    logging.info("=" * 30)
-    for _arg in vars(args):
-        logging.info(f"{_arg:20s}\t{getattr(args, _arg)}")
-    logging.info("=" * 30)
 
 
+def get_logger(args: Namespace, logger_name: str):
+    os.makedirs(args.exp_dir, exist_ok=True)
+
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+    handler = logging.FileHandler(join(args.exp_dir, "log.txt"), encoding="utf8")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    return logger
+
+
+def log(msg: str, logger: Logger = None, level="info"):
+    if logger is None:
+        print(msg, file=sys.stderr)
+    else:
+        getattr(logger, level)(msg)
+
+
+#### Training States ####
 class LimitedQueue:
     def __init__(self, max_len: int = -1, items: List[float] = None):
         self.max_len = max_len
@@ -116,3 +145,42 @@ class RuntimeMetric:
 
 
 StatePack = namedtuple("StatePack", ("epoch", "runtime_metric", "optimizer", "scheduler", "train_loader", "writer"))
+
+
+#### DP / DDP ####
+
+def use_DP(args: Namespace):
+    return ("cuda" in str(args.device)) and (args.parallel == "DP") and (torch.cuda.device_count() > 1)
+
+
+def use_DDP(args: Namespace):
+    return ("cuda" in str(args.device)) and (args.parallel == "DDP") and (torch.cuda.device_count() > 1)
+
+
+def get_free_port() -> int:
+    import socket
+
+    sock = socket.socket()
+    sock.bind(('', 0))
+    ip, port = sock.getsockname()
+    sock.close()
+
+    return port
+
+
+def setup_dist_environment(rank, world_size, master_port: int, store=None, logger: Logger = None):
+    if logger:
+        log(f"Setup, Rank: {rank}, world_size: {world_size}, master_port: {master_port}", logger)
+
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = str(master_port)
+
+    # initialize the process group
+    if os.name == "nt":
+        dist.init_process_group("gloo", rank=rank, world_size=world_size, store=store)
+    else:
+        dist.init_process_group("nccl", rank=rank, world_size=world_size, store=store)
+
+
+def cleanup_dist_environment():
+    dist.destroy_process_group()

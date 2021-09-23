@@ -1,11 +1,13 @@
-import logging
 from itertools import product
+from logging import Logger
 from typing import List
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from nltk.translate.bleu_score import corpus_bleu
+
+from utils.utils import log
 
 
 def precision(pred, refer) -> float:
@@ -134,7 +136,7 @@ def levenshtein_edit_distance(ref: List[str], hyp: List[str]) -> ErrorState:
     return e[len(e) - 1]
 
 
-def WER(refers: List[List[str]], hypos: List[List[str]], is_wer=True) -> float:
+def WER(refers: List[List[str]], hypos: List[List[str]], is_wer=True, logger: Logger = None) -> float:
     assert len(refers) == len(hypos)
 
     num_words = 0
@@ -149,14 +151,17 @@ def WER(refers: List[List[str]], hypos: List[List[str]], is_wer=True) -> float:
         error_words += state.total_cost
 
     if num_words == 0:
-        logging.warning("zero word in sentences")
+        log("zero word in sentences", logger)
         num_words += 1e-9
 
     wer = error_words / num_words
 
     leader = "WER" if is_wer else "CER"
-    logging.info(f"{leader} = {wer:.2%}, INS = {ins_num} ({ins_num / num_words:.2%}), "
-                 f"DEL = {del_num} ({del_num / num_words:.2%}), SUB={sub_num} ({sub_num / num_words:.2%})")
+    res = f"{leader} = {wer:.2%}, " \
+          f"INS = {ins_num} ({ins_num / num_words:.2%}), " \
+          f"DEL = {del_num} ({del_num / num_words:.2%}), " \
+          f"SUB={sub_num} ({sub_num / num_words:.2%})"
+    log(res, logger)
     return wer
 
 
@@ -191,7 +196,7 @@ def show_similarity_mtx(mtx, include_values=False, display_labels: list = None, 
     fig, ax = plt.subplots()
     W = 8 * n_classes / 32
     H = 6 * n_classes / 32
-    fig.set_size_inches(W, H)   # W, H
+    fig.set_size_inches(W, H)  # W, H
     im_ = ax.imshow(mtx, interpolation='nearest', cmap=cmap)
     cmap_min, cmap_max = im_.cmap(0), im_.cmap(256)
 

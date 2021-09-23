@@ -1,5 +1,4 @@
 import json
-import logging
 import math
 import os
 from os.path import join
@@ -12,6 +11,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bart.modeling_bart import BartEncoderLayer
 
+from utils.phone import unstressed_phone_map, stressed_phone_map
 from .config import LatticeBartConfig
 
 
@@ -23,7 +23,7 @@ class LatticeSelfAttention(nn.Module):
         self.dropout = dropout
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == self.embed_dim, \
-            f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim} and `num_heads`: {num_heads})."
+            f"embed_dim must be divisible by num_heads (`embed_dim`: {self.embed_dim} and `num_heads`: {num_heads})."
         self.scaling = self.head_dim ** -0.5
 
         self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -163,16 +163,23 @@ class LatticeEncoder(nn.Module):
         self.padding_idx = config.pad_token_id
         self.max_source_positions = config.max_position_embeddings
         self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
-        self.depth_clip = config.depth_clip
 
         if shared_embed is not None:
             self.embed_tokens = shared_embed
         else:
             self.embed_tokens = nn.Embedding(config.vocab_size, embed_dim, self.padding_idx)
 
-        self.positional_embed = nn.Embedding(self.depth_clip, embed_dim)
+        self.embed_positions = nn.Embedding(config.max_position_embeddings + 2, embed_dim, self.padding_idx)
+
+        # Phoneme embedding
+        if config.phone_embed == "none":
+            self.phone_embed = None
+        elif config.phone_embed == "unstressed":
+            self.phone_embed = nn.Embedding(len(unstressed_phone_map), embed_dim)
+        else:
+            self.phone_embed = nn.Embedding(len(stressed_phone_map), embed_dim)
+
         self.marginal_proj = nn.Linear(1, embed_dim)
-        # self.lattice_layer = LatticeEncoderLayer(config)
         self.lattice_layers = nn.ModuleList([LatticeEncoderLayer(config) for _ in range(config.lat_enc_layers)])
 
         self.layers = nn.ModuleList(
@@ -180,8 +187,9 @@ class LatticeEncoder(nn.Module):
         )
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def _prepare_word_embeds(self, input_ids: LongTensor, appendix: dict = None, batch_idx: LongTensor = None):
-        inputs_embeds = self.embed_tokens(input_ids)
+    def prepare_embeds(self, embed: nn.Embedding, input_ids: LongTensor, appendix: dict = None,
+                       batch_idx: LongTensor = None):
+        inputs_embeds = embed(input_ids)
 
         # When distributed training, `batch_idx` will not be None
         min_idx, max_idx = 0, input_ids.shape[0] - 1
@@ -196,17 +204,23 @@ class LatticeEncoder(nn.Module):
                 i -= min_idx
                 for j, ids in chunks.items():
                     _ids = torch.tensor(ids, dtype=torch.long, device=input_ids.device)
-                    _chunk_embed = self.embed_tokens(_ids).sum(dim=0)
+                    _chunk_embed = embed(_ids).sum(dim=0)
                     inputs_embeds[i, j] = (inputs_embeds[i, j] + _chunk_embed) / (len(ids) + 1)
         inputs_embeds = inputs_embeds * self.embed_scale
         return inputs_embeds
 
-    def forward(self, input_ids, appendix=None, min_depth=None, max_depth=None, lattice_mask=None,
-                forward_backward=None, marginals=None, output_attentions=False, output_hidden_states=False,
-                return_dict=True, batch_idx: Tensor = None):
+    def _pos_embedding(self, pos: Tensor):
+        pos = torch.clamp(pos + 2, 0, self.config.max_position_embeddings - 1)
+        return self.embed_positions(pos)
+
+    def forward(self, input_ids, appendix=None, phone_ids=None, phone_appendix=None, min_depth=None, max_depth=None,
+                lattice_mask=None, forward_backward=None, marginals=None, output_attentions=False,
+                output_hidden_states=False, return_dict=True, batch_idx: Tensor = None):
         """
         :param input_ids:       LongTensor. [B, S]
         :param appendix:        dict
+        :param phone_ids:       LongTensor. [B, S]
+        :param phone_appendix:  dict
         :param min_depth:       LongTensor. [B, S]
         :param max_depth:       LongTensor. [B, S]
         :param lattice_mask:        LongTensor or FloatTensor. [B, S, S]. {0, 1}
@@ -221,18 +235,22 @@ class LatticeEncoder(nn.Module):
         all_attentions = () if output_attentions else None
 
         # Word embedding
-        inputs_embeds = self._prepare_word_embeds(input_ids, appendix, batch_idx=batch_idx)
+        inputs_embeds = self.prepare_embeds(embed=self.embed_tokens, input_ids=input_ids,
+                                            appendix=appendix, batch_idx=batch_idx)
+        if phone_ids is not None:
+            phone_embeds = self.prepare_embeds(embed=self.phone_embed, input_ids=phone_ids,
+                                               appendix=phone_appendix, batch_idx=batch_idx)
+            inputs_embeds = inputs_embeds + phone_embeds
 
-        # Positional embedding
+            # Positional embedding
         if min_depth is None and max_depth is None:
             pos_embed = torch.zeros_like(inputs_embeds)
         elif min_depth is None:
-            pos_embed = self.positional_embed(torch.clamp(max_depth, 0, self.depth_clip - 1))
+            pos_embed = self._pos_embedding(max_depth)
         elif max_depth is None:
-            pos_embed = self.positional_embed(torch.clamp(min_depth, 0, self.depth_clip - 1))
+            pos_embed = self._pos_embedding(min_depth)
         else:
-            pos_embed = (self.positional_embed(torch.clamp(min_depth, 0, self.depth_clip - 1)) +
-                         self.positional_embed(torch.clamp(max_depth, 0, self.depth_clip - 1))) / 2
+            pos_embed = (self._pos_embedding(min_depth) + self._pos_embedding(max_depth)) / 2
 
         # Prepare hidden states
         hidden_states = inputs_embeds + pos_embed
@@ -339,7 +357,7 @@ class EncoderWrapper(nn.Module):
                 wt[b, eos_pos + 1:] = 0
                 # Assign token weight to each position
                 if pooling_method == "weight":
-                    for i in range(eos_pos+1):
+                    for i in range(eos_pos + 1):
                         wt[b, i] = token_id_weight[input_ids[b, i].item()]
 
             last_state = (hidden_states * wt.unsqueeze(dim=-1)).sum(dim=-2)
@@ -355,7 +373,7 @@ class EncoderWrapper(nn.Module):
         with open(join(model_path, "config.json"), "w", encoding="utf8") as f:
             config = self.config.to_dict()
             json.dump(config, f, indent=2, ensure_ascii=False)
-        logging.info(f"Save {self.__class__.__name__} to {model_path}")
+        # log(f"Save {self.__class__.__name__} to {model_path}", logger)
 
     @classmethod
     def from_pretrained(cls, model_path: str):
@@ -367,5 +385,5 @@ class EncoderWrapper(nn.Module):
         wrapper = cls(encoder)
         wrapper.proj.load_state_dict(torch.load(join(model_path, cls.PROJ_PT_FILE), map_location=lambda st, loc: st))
 
-        logging.info(f"Load {cls.__class__.__name__} from {model_path}")
+        # log(f"Load {cls.__class__.__name__} from {model_path}", logger)
         return wrapper

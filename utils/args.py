@@ -5,12 +5,13 @@ from os.path import join
 
 import torch
 
+PHONE_EMBED_CHOICE = ("none", "unstressed", "stressed")
+
 
 def add_args_for_model_construct(parser: ArgumentParser):
     p = parser.add_argument_group("Model construct")
     p.add_argument("--default_config", type=str, choices=("tiny", "base", "large"), help="Select configurations")
 
-    p.add_argument("--depth_clip", type=int, default=200, help="Lattice depth clip")
     p.add_argument("--lat_enc_layers", type=int, default=1, help="LatticeEncoder layers")
 
     p.add_argument("--bart_path", type=str, help="Pretrained Bart path")
@@ -18,6 +19,9 @@ def add_args_for_model_construct(parser: ArgumentParser):
 
     p.add_argument("--lat_bart_path", type=str, help="Pretrained LatticeBart path")
     p.add_argument("--lat_encoder", type=str, help="Pretrained LatticeEncoder path")
+
+    p.add_argument("--phone_embed", type=str, choices=PHONE_EMBED_CHOICE, default="none")
+    p.add_argument("--phone_embed_path", type=str, help="Pretrained phoneme embedding by gensim word2vec")
 
 
 def add_args_for_lr(parser: ArgumentParser):
@@ -69,9 +73,13 @@ def add_args_for_data_process(parser: ArgumentParser):
 
 def add_args_for_train_procedure(parser: ArgumentParser):
     p = parser.add_argument_group("Train-Eval-Test Procedure")
-    p.add_argument("--seed", type=int, default=1024)
     p.add_argument("--device", type=str, default="cuda:0")
-    p.add_argument("--optim", type=str, choices=["sgd", "adam", "lamb"], default="adam")
+    p.add_argument("--ngpus", type=int, default=torch.cuda.device_count())
+    p.add_argument("--parallel", type=str, choices=("none", "DP", "DDP"), default="DP", help="Use DP / DDP or not")
+    # p.add_argument("--local_rank", type=int, default=-1)
+
+    p.add_argument("--seed", type=int, default=1024)
+    p.add_argument("--optim", type=str, choices=["sgd", "adam", "lamb", "lookahead"], default="adam")
     p.add_argument("--exp_dir", type=str, required=True)
 
     p.add_argument("--epoch", type=int, default=10)
@@ -104,13 +112,14 @@ def add_args_for_seq2seq_generation(parser: ArgumentParser):
     p.add_argument("--num_beams", type=int, default=1)
     p.add_argument("--min_len", type=int, required=True)
     p.add_argument("--max_len", type=int, required=True)
+    # p.add_argument("--constrain", type=int, choices=(0, 1), default=0, help="Do beam search with constrain")
 
 
 ####### CONFIG #######
 
 name_abbr = {
-    "init_model": "init", "lat_enc_layers": "nlayer", "lr": "lr", "optim": "optim", "seed": "seed",
-    "train_batch": "batch", "contrast_method": "contrast", "pooling_method": "pool",
+    "init_model": "init", "lat_enc_layers": "nlayer", "phone_embed": "phn", "lr": "lr", "optim": "optim",
+    "parallel": "pall", "seed": "seed", "train_batch": "batch", "contrast_method": "contrast", "pooling_method": "pool",
     "use_marginal": "m", "use_min_depth": "mD", "use_max_depth": "MD", "use_forward_backward": "fb",
     "use_lattice_mask": "MSK", "use_binary_mask": "binM", "homophone_replace": "homo"
 }
@@ -132,22 +141,26 @@ def config_exp_dir(args: Namespace):
     else:
         raise ValueError("One of --bart_path and --lat_bart_path should be set")
 
-    if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
-        method = re.findall("(" + "|".join(CHOICE) + ")", getattr(args, "lat_encoder"))
+    lat_encoder = getattr(args, "lat_encoder", None)
+    if (lat_encoder is not None) and (lat_encoder.strip() != ""):
+        method = re.findall("(" + "|".join(CHOICE) + ")", lat_encoder)
         if len(method) == 1:
             method = method[0]
         elif len(method) == 0:
-            raise ValueError(f"Can not find any choices ({CHOICE}) in `lat_encoder`")
+            raise ValueError(f"Can not find any choices ({CHOICE}) in `lat_encoder` ({lat_encoder})")
         else:
-            raise ValueError(f"Multiple choices on `{CHOICE}` in `lat_encoder`")
+            raise ValueError(f"Multiple choices on `{CHOICE}` in `lat_encoder` ({method})")
         parts.append(f"ENC-{method}")
 
     if getattr(args, "init_model"):
         parts.append("init")
 
-    for name in ("lat_enc_layers", "lr", "optim", "seed", "train_batch", "contrast_method", "pooling_method"):
+    for name in ("lat_enc_layers", "phone_embed", "lr", "optim", "parallel", "seed",
+                 "train_batch", "contrast_method", "pooling_method"):
         val = getattr(args, name, None)
         if val is not None:
+            if name == "train_batch":
+                val = int(val * args.grad_acc_steps)
             name = name_abbr[name]
             parts.append(f"{name}-{val}")
 

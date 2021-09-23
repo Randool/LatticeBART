@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 from os.path import join
 from typing import Optional, Iterable, Callable, List
@@ -13,11 +12,15 @@ from transformers.file_utils import ModelOutput
 from transformers.modeling_outputs import Seq2SeqModelOutput, Seq2SeqLMOutput
 from transformers.models.bart.modeling_bart import BartDecoder, BartPretrainedModel
 
+from utils.utils import log
 from .config import LatticeBartConfig
 from .encoder import LatticeEncoder
 
 
 class LatticeBartBase(BartPretrainedModel):
+    def _reorder_cache(self, past, beam_idx):
+        raise NotImplementedError
+
     def __init__(self, config: LatticeBartConfig):
         super().__init__(config)
 
@@ -42,15 +45,18 @@ class LatticeBartBase(BartPretrainedModel):
         return self.decoder
 
     # LatticeBartBase
-    def forward(self, input_ids=None, appendix=None, min_depth=None, max_depth=None, lattice_mask=None,
-                forward_backward=None, marginals=None, enc_dec_attention_mask=None, encoder_outputs=None,
-                past_key_values=None, decoder_input_ids=None, decoder_attention_mask=None, use_cache=True,
-                output_attentions=False, output_hidden_states=False, return_dict=True, batch_idx: Tensor = None):
+    def forward(self, input_ids=None, appendix=None, phone_ids=None, phone_appendix=None, min_depth=None,
+                max_depth=None, lattice_mask=None, forward_backward=None, marginals=None, enc_dec_attention_mask=None,
+                encoder_outputs=None, past_key_values=None, decoder_input_ids=None, decoder_attention_mask=None,
+                use_cache=True, output_attentions=False, output_hidden_states=False, return_dict=True,
+                batch_idx: Tensor = None):
         # Encoder forward
         if encoder_outputs is None:
             encoder_outputs = self.encoder.forward(
                 input_ids=input_ids,
                 appendix=appendix,
+                phone_ids=phone_ids,
+                phone_appendix=phone_appendix,
                 min_depth=min_depth,
                 max_depth=max_depth,
                 lattice_mask=lattice_mask,
@@ -95,6 +101,7 @@ class LatticeBartBase(BartPretrainedModel):
 
 class LatticeBart(BartPretrainedModel):
     MODEL_PT = "lattice_bart.pt"
+    config: LatticeBartConfig
 
     def __init__(self, config: LatticeBartConfig):
         super().__init__(config)
@@ -118,14 +125,16 @@ class LatticeBart(BartPretrainedModel):
         self.lm_head = new_embeddings
 
     # LatticeBart
-    def forward(self, input_ids=None, appendix=None, min_depth=None, max_depth=None, lattice_mask=None,
-                forward_backward=None, marginals=None, enc_dec_attention_mask=None, encoder_outputs=None,
-                past_key_values=None, decoder_input_ids=None, decoder_attention_mask=None, labels=None,
-                use_cache=True, output_attentions=False, output_hidden_states=False, return_dict=True,
+    def forward(self, input_ids=None, appendix=None, phone_ids=None, phone_appendix=None, min_depth=None,
+                max_depth=None, lattice_mask=None, forward_backward=None, marginals=None, enc_dec_attention_mask=None,
+                encoder_outputs=None, past_key_values=None, decoder_input_ids=None, decoder_attention_mask=None,
+                labels=None, use_cache=True, output_attentions=False, output_hidden_states=False, return_dict=True,
                 batch_idx: Tensor = None, reduction="mean"):
         outputs = self.model.forward(
             input_ids=input_ids,
             appendix=appendix,
+            phone_ids=phone_ids,
+            phone_appendix=phone_appendix,
             min_depth=min_depth,
             max_depth=max_depth,
             lattice_mask=lattice_mask,
@@ -171,7 +180,7 @@ class LatticeBart(BartPretrainedModel):
         with open(join(model_path, "config.json"), "w", encoding="utf8") as f:
             config = self.config.to_dict()
             json.dump(config, f, indent=2, ensure_ascii=False)
-        logging.info(f"Save {self.__class__.__name__} to {model_path}")
+        # log(f"Save {self.__class__.__name__} to {model_path}", logger)
 
     @classmethod
     def from_pretrained(cls, model_path: str, *model_args, **kwargs):
@@ -179,11 +188,11 @@ class LatticeBart(BartPretrainedModel):
             config = LatticeBartConfig.from_dict(json.load(f))
         lattice_bart = cls(config)
         lattice_bart.load_state_dict(torch.load(join(model_path, cls.MODEL_PT), map_location=lambda st, loc: st))
-        logging.info(f"Load {cls.__class__.__name__} from {model_path}")
+        # log(f"Load {cls.__class__.__name__} from {model_path}", logger)
         return lattice_bart
 
     @classmethod
-    def from_bart(cls, bart_path: str, depth_clip: int, lat_enc_layers: int):
+    def from_bart(cls, bart_path: str, lat_enc_layers: int, phone_embed: str):
         bart = BartForConditionalGeneration.from_pretrained(bart_path)
         config = bart.config.to_dict()
 
@@ -191,8 +200,8 @@ class LatticeBart(BartPretrainedModel):
             f"lat_enc_layers({lat_enc_layers}) larger than " \
             f"bart.config.encoder_layers({bart.config.encoder_layers})"
 
-        config["depth_clip"] = depth_clip
         config["lat_enc_layers"] = lat_enc_layers
+        config["phone_embed"] = phone_embed
         lattice_bart = cls(LatticeBartConfig.from_dict(config))
 
         # Move parameters from pretrained bart
@@ -201,7 +210,7 @@ class LatticeBart(BartPretrainedModel):
         # Offset Lattice Encoder's layers
         for i in range(bart.config.encoder_layers):
             if i < lat_enc_layers:
-                """
+                r"""
                 Apply replacements
                     layers => lattice_layers
                     self_attn => lattice_self_attn 
@@ -213,8 +222,8 @@ class LatticeBart(BartPretrainedModel):
                 prefix = f"model.encoder.layers.{i}"
                 for key in list(params.keys()):
                     if key.startswith(prefix):
-                        new_key = key.replace(".layers.", ".lattice_layers.")\
-                                     .replace(".self_attn.", ".lattice_self_attn.")
+                        new_key = key.replace(".layers.", ".lattice_layers.") \
+                            .replace(".self_attn.", ".lattice_self_attn.")
                         params[new_key] = params[key]
                         del params[key]
             else:
@@ -228,10 +237,10 @@ class LatticeBart(BartPretrainedModel):
         # Set parameters
         for key, param in lattice_bart.named_parameters():
             if key not in params:
-                logging.debug(f"[x] {key}\t no found")
+                log(f"[x] {key}\t no found", None, "error")
                 continue
             if param.shape != params[key].shape:
-                logging.debug(f"[x] {key}\t shape mismatch between bart and lattice bart")
+                log(f"[x] {key}\t shape mismatch between bart and lattice bart", None, "error")
                 continue
             param.data = params[key].data
             # logging.debug(f"[v] {key}")
@@ -241,6 +250,7 @@ class LatticeBart(BartPretrainedModel):
     @torch.no_grad()
     def generate(
             self, input_ids, appendix, min_depth, max_depth, lattice_mask,
+            phone_ids=None, phone_appendix=None,
             forward_backward=None, marginals=None,
             max_length: Optional[int] = None,
             min_length: Optional[int] = None,
@@ -291,9 +301,10 @@ class LatticeBart(BartPretrainedModel):
         model_kwargs["enc_dec_attention_mask"] = input_ids.ne(pad_token_id).long()
 
         model_kwargs["encoder_outputs"] = self.model.encoder.forward(
-            input_ids=input_ids, appendix=appendix, min_depth=min_depth, max_depth=max_depth,
-            lattice_mask=lattice_mask, forward_backward=forward_backward, marginals=marginals,
-            output_attentions=output_attentions, output_hidden_states=output_hidden_states, batch_idx=batch_idx
+            input_ids=input_ids, appendix=appendix, phone_ids=phone_ids, phone_appendix=phone_appendix,
+            min_depth=min_depth, max_depth=max_depth, lattice_mask=lattice_mask, forward_backward=forward_backward,
+            marginals=marginals, output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+            batch_idx=batch_idx
         )
 
         # set input_ids as decoder_input_ids
@@ -303,9 +314,10 @@ class LatticeBart(BartPretrainedModel):
             input_ids = input_ids.new(input_ids.shape[0], 1).fill_(bos_token_id)
 
         if input_ids.shape[-1] >= max_length:
-            logging.warning(
+            log(
                 f"Input length of decoder_input_ids is {input_ids.shape[-1]}, but ``max_length`` is set to {max_length}."
-                "This can lead to unexpected behavior. You should consider increasing ``config.max_length`` or ``max_length``."
+                "This can lead to unexpected behavior. You should consider increasing ``config.max_length`` or ``max_length``.",
+                None, "warning"
             )
 
         # determine generation mode
@@ -547,8 +559,7 @@ class LatticeBart(BartPretrainedModel):
         """force one of token_ids to be generated by setting prob of all other tokens to 0 (logprob=-float("inf"))"""
         scores[:, [x for x in range(scores.shape[1]) if x != token_id]] = -float("inf")
 
-    @staticmethod
-    def _reorder_cache(past, beam_idx):
+    def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
         for layer_past in past:
             # cached cross_attention states don't have to be reordered -> they are always the same

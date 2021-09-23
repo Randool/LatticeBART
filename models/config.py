@@ -35,7 +35,7 @@ class LatticeBartConfig(BartConfig):
             eos_token_id=2,
             is_encoder_decoder=True,
             decoder_start_token_id=2,
-            depth_clip=200,
+            phone_embed="none",
             **kwargs
     ):
         super().__init__(
@@ -73,7 +73,7 @@ class LatticeBartConfig(BartConfig):
         self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
         self.force_bos_token_to_be_generated = force_bos_token_to_be_generated  # only relevant for CNN
 
-        self.depth_clip = depth_clip
+        self.phone_embed = phone_embed
 
     @property
     def num_attention_heads(self) -> int:
