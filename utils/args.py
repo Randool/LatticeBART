@@ -75,7 +75,7 @@ def add_args_for_train_procedure(parser: ArgumentParser):
     p = parser.add_argument_group("Train-Eval-Test Procedure")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--ngpus", type=int, default=torch.cuda.device_count())
-    p.add_argument("--parallel", type=str, choices=("none", "DP", "DDP"), default="DP", help="Use DP / DDP or not")
+    p.add_argument("--parallel", type=str, choices=("none", "DP", "DDP"), default="none", help="Use DP / DDP or not")
     # p.add_argument("--local_rank", type=int, default=-1)
 
     p.add_argument("--seed", type=int, default=1024)

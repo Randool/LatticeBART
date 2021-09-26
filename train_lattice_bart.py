@@ -325,18 +325,12 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
 
             metric = metrics[args.use_metric]
 
-            if mtc.best_metrics is None or \
-                    (mtc.best_metrics <= metric and args.use_metric in ("bleu",)) or \
-                    (mtc.best_metrics >= metric and args.use_metric in ("cer", "wer", "loss")):
-                mtc.best_metrics = metric
-
+            if mtc.metric_is_better_than_ever(metric):
                 save_checkpoint(epoch=epoch, model=_model, metric=metric, optimizer=optimizer,
                                 tokenizer=tokenizer, runtime_metric=mtc, args=args, logger=logger)
-        else:
-            metric = None
 
         # If meet the requirement of early_stop (then inform other processes), then break the loop
-        if mtc and metric and mtc.early_stop.stop(metric):
+        if mtc and mtc.do_early_stop:
             early_stop.fill_(1)
 
         if is_DDP:
@@ -441,6 +435,9 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
     except KeyboardInterrupt:
         if logger:
             logger.info("Interrupt by user.")
+
+    if logger:
+        logger.info("======== Finish training ========")
 
     if rank != -1:
         cleanup_dist_environment()

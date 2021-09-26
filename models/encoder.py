@@ -242,7 +242,7 @@ class LatticeEncoder(nn.Module):
                                                appendix=phone_appendix, batch_idx=batch_idx)
             inputs_embeds = inputs_embeds + phone_embeds
 
-            # Positional embedding
+        # Positional embedding
         if min_depth is None and max_depth is None:
             pos_embed = torch.zeros_like(inputs_embeds)
         elif min_depth is None:

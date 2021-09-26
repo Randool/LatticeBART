@@ -4,7 +4,6 @@ import os
 import random
 import sys
 from argparse import Namespace
-from collections import namedtuple
 from logging import Logger
 from os.path import join
 from typing import List
@@ -40,10 +39,18 @@ def get_logger(args: Namespace, logger_name: str):
 
     logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%H:%M:%S')
-    handler = logging.FileHandler(join(args.exp_dir, "log.txt"), encoding="utf8")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+
+    if len(logger.handlers) > 0:
+        for handler in logger.handlers:
+            logger.removeHandler(handler)
+
+    # Repeated calls to `addHandler` result in repeated log output
+    if len(logger.handlers) == 0:
+        # print(f"Add handler to {logger_name}")
+        formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+        handler = logging.FileHandler(join(args.exp_dir, "log.txt"), encoding="utf8")
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
     return logger
 
@@ -94,40 +101,59 @@ class LimitedQueue:
 
 class EarlyStopping:
     def __init__(self, patience: int = 1, decrease=True):
-        self.metrics = LimitedQueue(patience)
+        self.patience = patience
         self.decrease = decrease
+        self.counter = 0
+        self.best_metric = None
 
-    def stop(self, metric: float) -> bool:
-        if not self.metrics.is_full:
-            self.metrics.append(metric)
-            return False
+    @property
+    def is_stop(self):
+        return self.counter >= self.patience
 
+    def is_better(self, metric: float) -> bool:
+        if self.best_metric is None:
+            return True
         if self.decrease:
-            satisfy = any([metric < x for x in self.metrics])
+            return metric < self.best_metric
         else:
-            satisfy = any([metric > x for x in self.metrics])
-        self.metrics.append(metric)
+            return metric > self.best_metric
 
-        return not satisfy
-
-    def __repr__(self):
-        return f"EarlyStopping<decrease={self.decrease},{repr(self.metrics)}>"
+    def record(self, metric: float):
+        if self.best_metric is None:
+            self.counter = 0
+            self.best_metric = metric
+        else:
+            if self.is_better(metric):
+                self.counter = 0
+                self.best_metric = metric
+            else:
+                self.counter += 1
 
 
 class RuntimeMetric:
     def __init__(self, best_metrics=None, window_size=10, patience=1, decrease=True):
-        self.best_metrics = best_metrics
         self.avg_loss = LimitedQueue(window_size)
         self.early_stop = EarlyStopping(patience, decrease)
+        self.early_stop.best_metric = best_metrics
+
+    def metric_is_better_than_ever(self, metric: float) -> bool:
+        """ Compare and log the metric """
+        is_better = self.early_stop.is_better(metric)
+        self.early_stop.record(metric)
+        return is_better
+
+    @property
+    def do_early_stop(self) -> bool:
+        return self.early_stop.is_stop
 
     def dump(self, filename: str):
         tmp = {
-            "best_metrics": self.best_metrics,
+            "best_metrics": self.early_stop.best_metric,
             "window_size": self.avg_loss.max_len,
-            "patience": self.early_stop.metrics.max_len,
+            "patience": self.early_stop.patience,
             "decrease": self.early_stop.decrease,
             "avg_loss.items": self.avg_loss.items,
-            "early_stop.metrics.items": self.early_stop.metrics.items
+            "early_stop.counter": self.early_stop.counter
         }
         with open(filename, "w", encoding="utf8") as f:
             json.dump(tmp, f, indent=1)
@@ -137,14 +163,11 @@ class RuntimeMetric:
         with open(filename, encoding="utf8") as f:
             tmp = json.load(f)
             avg_loss_items = tmp.pop("avg_loss.items")
-            early_stop_metrics_items = tmp.pop("early_stop.metrics.items")
+            early_stop_counter = tmp.pop("early_stop.counter")
         ins = cls(**tmp)
         ins.avg_loss.items = avg_loss_items
-        ins.early_stop.metrics.items = early_stop_metrics_items
+        ins.early_stop.counter = early_stop_counter
         return ins
-
-
-StatePack = namedtuple("StatePack", ("epoch", "runtime_metric", "optimizer", "scheduler", "train_loader", "writer"))
 
 
 #### DP / DDP ####

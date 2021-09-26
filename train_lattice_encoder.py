@@ -205,11 +205,11 @@ def get_encoder_and_tokenizer(args: Namespace, logger: Logger, to_device):
 
 
 def wrap_distributed_parallel(rank, model: Union[EncoderWrapper, LatticeBart], args: Namespace, logger: Logger):
-    if args.parallel == "DP":
+    if args.parallel == "DP" and args.ngpus > 1:
         if logger:
             logger.info(f"Found {args.ngpus} GPUs, using DataParallel")
         model = DP(model.to(args.device))
-    elif args.parallel == "DDP":
+    elif args.parallel == "DDP" and args.ngpus > 1:
         if logger:
             logger.info(f"Rank: {rank}. Found {args.ngpus} GPUs, using DistributedDataParallel")
         torch.cuda.set_device(f"cuda:{rank}")
