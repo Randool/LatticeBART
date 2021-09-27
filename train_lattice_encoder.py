@@ -131,7 +131,7 @@ def select_best_checkpoint(exp_dir: str, use_metric: str, logger: Logger = None)
                     best_exp_dir = prefix
                     largest_n = n
             else:
-                if best_metric < metric and (best_metric == metrics and n > largest_n):
+                if best_metric < metric or (best_metric == metrics and n > largest_n):
                     best_metric = metric
                     best_exp_dir = prefix
                     largest_n = n
