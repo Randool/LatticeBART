@@ -3,7 +3,6 @@ import os
 import pickle
 import random
 from collections import namedtuple
-# from logging import Logger
 from os.path import exists, join, split
 from typing import Union, Dict, Any, List
 
@@ -17,7 +16,6 @@ from dataset.parse import parse_lattice_file, line_graph_process, parse_lattice_
 from utils.args import PHONE_EMBED_CHOICE
 from utils.phone import HomophoneReplacer
 from utils.tokenizer import word_based_tokenize
-# from utils.utils import log
 
 MAX_NODEs = int(1e3)
 

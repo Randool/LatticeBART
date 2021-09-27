@@ -92,9 +92,14 @@ def prepare_datasets(args: Namespace, logger: Logger):
 
     test_lat = [None] * len(args.test_lat_ark) if len(args.test_lat) == 0 else args.test_lat
     test_lat_ark = [None] * len(args.test_lat) if len(args.test_lat_ark) == 0 else args.test_lat_ark
+    if len(args.test_text) == 1:
+        text_patterns = [args.test_text[0]] * len(test_lat)
+    else:
+        assert len(args.test_text) == len(test_lat)
+        text_patterns = args.test_text
 
-    for i, (_lat, _lat_ark) in enumerate(zip(test_lat, test_lat_ark)):
-        testset = LatticeTextDataset(lattice_pattern=_lat, lattice_ark_pattern=_lat_ark, text_pattern=args.test_text,
+    for i, (_lat, _lat_ark, text) in enumerate(zip(test_lat, test_lat_ark, text_patterns)):
+        testset = LatticeTextDataset(lattice_pattern=_lat, lattice_ark_pattern=_lat_ark, text_pattern=text,
                                      process_cfg=process_cfg_for_test)
         testsets.append(testset)
 

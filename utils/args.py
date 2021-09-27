@@ -49,7 +49,7 @@ def add_args_for_data_path(parser: ArgumentParser):
 
     p.add_argument("--train_text", type=str, help="/path/to/text")
     p.add_argument("--eval_text", type=str, help="/path/to/text")
-    p.add_argument("--test_text", type=str, help="/path/to/text")
+    p.add_argument("--test_text", type=str, nargs="*", default=[], help="/path/to/text")
 
 
 def add_args_for_data_process(parser: ArgumentParser):
