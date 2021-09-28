@@ -98,6 +98,10 @@ class LatticeBartBase(BartPretrainedModel):
             encoder_attentions=encoder_outputs.attentions
         )
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
 
 class LatticeBart(BartPretrainedModel):
     MODEL_PT = "lattice_bart.pt"
@@ -173,6 +177,10 @@ class LatticeBart(BartPretrainedModel):
             encoder_hidden_states=outputs.encoder_hidden_states,
             encoder_attentions=outputs.encoder_attentions
         )
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def save_pretrained(self, model_path: str):
         os.makedirs(model_path, exist_ok=True)

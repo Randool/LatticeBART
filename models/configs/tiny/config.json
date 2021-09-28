@@ -69,5 +69,5 @@
   "transformers_version": "4.7.0.dev0",
   "use_cache": true,
   "vocab_size": 50265,
-  "phone_embed": "stressed"
+  "phone_embed": "none"
 }

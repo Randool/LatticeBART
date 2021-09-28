@@ -74,19 +74,16 @@ def prepare_datasets(args: Namespace, logger: Logger):
     if args.train_lat is not None or args.train_lat_ark is not None:
         trainset = LatticeTextDataset(lattice_pattern=args.train_lat,
                                       lattice_ark_pattern=args.train_lat_ark,
-                                      cache_dir=join(args.cache_dir, "cache_train"),
                                       process_cfg=process_cfg)
 
     if args.eval_lat is not None or args.eval_lat_ark is not None:
         devset = LatticeTextDataset(lattice_pattern=args.eval_lat,
                                     lattice_ark_pattern=args.eval_lat_ark,
-                                    cache_dir=join(args.cache_dir, "cache_dev"),
                                     process_cfg=process_cfg_for_test)
 
     if args.debug_lat is not None or args.debug_lat_ark is not None:
         debug_set = LatticeTextDataset(lattice_pattern=args.debug_lat,
                                        lattice_ark_pattern=args.debug_lat_ark,
-                                       cache_dir=join(args.cache_dir, "cache_dev"),
                                        process_cfg=process_cfg_for_test)
 
     if len(args.test_lat) == 0 and len(args.test_lat_ark) == 0:
@@ -170,7 +167,9 @@ def get_encoder_and_tokenizer(args: Namespace, logger: Logger, to_device):
             logger.info(f"Load checkpoint from '{ckpt_dir}'")
     else:
         if args.default_config is not None:
-            encoder = LatticeBart(get_model_config(args.default_config)).get_encoder()
+            config = get_model_config(args.default_config)
+            config.phone_embed = args.phone_embed
+            encoder = LatticeBart(config).get_encoder()
             tokenizer = get_tokenizer()
 
         elif args.bart_path is not None:
@@ -240,9 +239,7 @@ def save_checkpoint(epoch: int, model, metric, optimizer, tokenizer: BartTokeniz
     os.makedirs(exp_dir, exist_ok=True)
 
     # Model state and config.json
-    if isinstance(model, DP):
-        model.module.save_pretrained(exp_dir)
-    elif isinstance(model, DDP):
+    if isinstance(model, (DP, DDP)):
         model.module.save_pretrained(exp_dir)
     else:
         model.save_pretrained(exp_dir)
@@ -398,8 +395,8 @@ def training(encoder: Union[EncoderWrapper, DP, DDP], tokenizer: BartTokenizer, 
                 mtc.avg_loss.append(loss.item())
 
             global_step = len(train_loader) * (epoch - 1) + step
-            # if writer is not None:
-            #     writer.add_scalar(tag="loss", scalar_value=loss.item(), global_step=global_step)
+            if writer:
+                writer.add_scalar(tag="loss", scalar_value=loss.item(), global_step=global_step)
 
             if logger and step % args.log_every == 0:
                 lrs = [f"{group['lr']:.2e}" for group in optimizer.param_groups]
@@ -437,18 +434,12 @@ def training(encoder: Union[EncoderWrapper, DP, DDP], tokenizer: BartTokenizer, 
             )
             metric = metrics[args.use_metric]
 
-            if mtc.best_metrics is None or \
-                    (mtc.best_metrics < metric and args.use_metric in ("bleu",)) or \
-                    (mtc.best_metrics > metric and args.use_metric in ("cer", "wer", "loss")):
-                mtc.best_metrics = metric
-
+            if mtc.metric_is_better_than_ever(metric):
                 save_checkpoint(epoch=epoch, model=encoder, metric=metric, optimizer=optimizer,
                                 tokenizer=tokenizer, runtime_metric=mtc, args=args, logger=logger)
-        else:
-            metric = None
 
         # If meet the requirement of early_stop (then inform other processes), then break the loop
-        if mtc and metric and mtc.early_stop.stop(metric):
+        if mtc and mtc.do_early_stop:
             early_stop.fill_(1)
 
         if is_DDP:
@@ -462,11 +453,11 @@ def training(encoder: Union[EncoderWrapper, DP, DDP], tokenizer: BartTokenizer, 
 
 def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDataset, devset: LatticeTextDataset,
           args: Namespace, debugset: LatticeTextDataset = None, logger: Logger = None):
-    if trainset is None or len(trainset) > 0:
+    if trainset is None or len(trainset) == 0:
         logger.error("Empty trainset")
         return
 
-    if devset is None or len(devset) > 0:
+    if devset is None or len(devset) == 0:
         logger.error("Empty devset")
         return
 
@@ -496,7 +487,7 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
                            phone_embed=args.phone_embed).collate_fn
 
     train_loader = DataLoader(
-        trainset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        trainset, batch_size=batch_size, shuffle=False if _use_DDP else True, num_workers=num_workers,
         collate_fn=collate_fn, sampler=DistributedSampler(trainset, seed=args.seed) if _use_DDP else None
     )
     dev_loader = DataLoader(
@@ -514,7 +505,8 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
 
     optimizer = config_optimizer(encoder, args)
     total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
-    logger.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
+    if logger:
+        logger.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=floor(total_steps * 0.01),
@@ -539,7 +531,8 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
         for i in range(epoch_trained):
             for _ in train_loader:
                 break
-            logger.info(f"Pass epoch {i + 1}")
+            if logger:
+                logger.info(f"Pass epoch {i + 1}")
 
         mtc = RuntimeMetric.load(join(ckpt_dir, "runtime_metric.json"))
 
@@ -551,7 +544,8 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
                  optimizer=optimizer, scheduler=scheduler, writer=writer, args=args, logger=logger,
                  epoch_trained=epoch_trained, runtime_metric=mtc, debug_loader=debug_loader)
     except KeyboardInterrupt:
-        logger.info("Interrupt by user.")
+        if logger:
+            logger.info("Interrupt by user.")
 
     if rank != -1:
         cleanup_dist_environment()
@@ -575,7 +569,8 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
         if use_DP(args):
             encoder = wrap_distributed_parallel(rank=-1, model=encoder, args=args, logger=logger)
 
-        logger.info("======== Start testing ========")
+        if logger:
+            logger.info("======== Start testing ========")
 
         collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1),
                                phone_embed=args.phone_embed).collate_fn
@@ -586,18 +581,20 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
             evaluate(encoder=encoder, tokenizer=tokenizer, dataloader=test_loader, args=args, logger=logger)
 
     except FileNotFoundError:
-        logger.error("FileNotFoundError!")
+        if logger:
+            logger.error("FileNotFoundError!")
 
         config_file = join(exp_dir, "config.json")
         enc_pt_file = join(exp_dir, EncoderWrapper.ENC_PT_FILE)
         proj_pt_file = join(exp_dir, EncoderWrapper.PROJ_PT_FILE)
 
-        if not exists(config_file):
-            logger.error(f"config_file: `{config_file}` not found")
-        if not exists(enc_pt_file):
-            logger.error(f"enc_pt_file: `{enc_pt_file}` not found")
-        if not exists(proj_pt_file):
-            logger.error(f"proj_pt_file: `{proj_pt_file}` not found")
+        if logger:
+            if not exists(config_file):
+                logger.error(f"config_file: `{config_file}` not found")
+            if not exists(enc_pt_file):
+                logger.error(f"enc_pt_file: `{enc_pt_file}` not found")
+            if not exists(proj_pt_file):
+                logger.error(f"proj_pt_file: `{proj_pt_file}` not found")
 
 
 def main(_args: List[str] = None):
@@ -636,7 +633,8 @@ def main(_args: List[str] = None):
             port = get_free_port()
             mp.spawn(train, args=(world_size, port, trainset, devset, args, None), nprocs=world_size, join=True)
         else:
-            pass
+            train(rank=-1, world_size=-1, master_port=-1, trainset=trainset, devset=devset, args=args,
+                  debugset=debug_set, logger=logger)
     else:
         logger.info("Training phase is passed.")
 
@@ -644,6 +642,8 @@ def main(_args: List[str] = None):
         test(testsets=testsets, args=args, logger=logger)
     else:
         logger.info("Testing phase is passed.")
+
+    return args.exp_dir
 
 
 if __name__ == '__main__':

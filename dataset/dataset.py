@@ -186,8 +186,12 @@ class _OracleDataset(__TextDataset):
 
 
 class TextDataset(__TextDataset):
-    def __init__(self, text_file_pattern: str, lower_case=True):
+    def __init__(self, text_file_pattern: str, lower_case=True, norm=False):
         super().__init__(text_file_pattern, lower_case=lower_case, token_split=False)
+        if norm:
+            for key, val in self.items.keys():
+                # TODO: 实现text正则化功能
+                self.items[key] = val
 
 
 DataProcessCfg = namedtuple("DataProcessCfg", (

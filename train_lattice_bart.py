@@ -115,7 +115,9 @@ def get_model_and_tokenizer(args: Namespace, logger: Logger, to_device):
             logger.info(f"Load checkpoint from '{ckpt_dir}'")
     else:
         if args.default_config is not None:
-            model = LatticeBart(get_model_config(args.default_config))
+            config = get_model_config(args.default_config)
+            config.phone_embed = args.phone_embed
+            model = LatticeBart(config)
             tokenizer = get_tokenizer()
 
         elif args.bart_path is not None:
@@ -147,11 +149,12 @@ def get_model_and_tokenizer(args: Namespace, logger: Logger, to_device):
 
         if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
             best_ckpt = select_best_checkpoint(args.lat_encoder, use_metric="loss", logger=logger)
-            model.get_encoder().load_state_dict(
-                torch.load(join(best_ckpt, LatticeEncoder.MODEL_PT), map_location=lambda st, loc: st)
-            )
-            if logger:
-                logger.info(f"Load pretrained LatticeEncoder from '{best_ckpt}'")
+            if best_ckpt is not None:
+                model.get_encoder().load_state_dict(
+                    torch.load(join(best_ckpt, LatticeEncoder.MODEL_PT), map_location=lambda st, loc: st)
+                )
+                if logger:
+                    logger.info(f"Load pretrained LatticeEncoder from '{best_ckpt}'")
 
     model.to(to_device)
     return model, tokenizer
@@ -537,6 +540,8 @@ def main(_args: List[str] = None):
         test(testsets=testsets, args=args, logger=logger)
     else:
         logger.info("Testing phase is passed.")
+
+    return args.exp_dir
 
 
 if __name__ == '__main__':

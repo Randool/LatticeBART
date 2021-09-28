@@ -319,6 +319,10 @@ class LatticeEncoder(nn.Module):
             last_hidden_state=hidden_states, hidden_states=None, attentions=all_attentions
         )
 
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
 
 class EncoderWrapper(nn.Module):
     ENC_PT_FILE = LatticeEncoder.MODEL_PT
@@ -365,6 +369,10 @@ class EncoderWrapper(nn.Module):
 
         last_state = self.proj(last_state)
         return last_state
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def save_pretrained(self, model_path: str):
         os.makedirs(model_path, exist_ok=True)
