@@ -12,7 +12,6 @@ from typing import Union, List
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from gensim.models import KeyedVectors
 from torch import nn
 from torch.distributed import ReduceOp
 from torch.nn import DataParallel as DP
@@ -22,14 +21,13 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import BartTokenizer, AdamW, get_cosine_schedule_with_warmup
 
 from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, CollateFn
-from models.config import get_model_config, get_tokenizer, LatticeBartConfig
+from models.config import get_model_config, get_tokenizer
 from models.encoder import EncoderWrapper
 from models.lattice_bart import LatticeBart
 from models.model_utils import config_layer_wise_lr, model_init
 from utils.args import *
 from utils.metric import cos_similarity_mtx, contrastive_loss, show_similarity_mtx
 from utils.optimizer import Lamb, Lookahead
-from utils.phone import stressed_phone_map, unstressed_phone_map
 from utils.utils import RuntimeMetric, get_logger, show_args, use_DDP, get_free_port, setup_dist_environment, set_seed, \
     use_DP, cleanup_dist_environment
 
@@ -60,13 +58,13 @@ def prepare_datasets(args: Namespace, logger: Logger):
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
         use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
-        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
-        homophone_replace=args.homophone_replace
+        use_lattice_mask=args.use_lattice_mask, homophone_replace=args.homophone_replace,
+        token_mask=args.token_mask, depth_disturb=args.depth_disturb,
     )
     process_cfg_for_test = DataProcessCfg(
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
-        use_lattice_mask=1, binary_mask=1, homophone_replace=0
+        use_lattice_mask=1, homophone_replace=0, token_mask=0, depth_disturb=0,
     )
 
     trainset, devset, debug_set, testsets = None, None, None, []
@@ -139,25 +137,6 @@ def select_best_checkpoint(exp_dir: str, use_metric: str, logger: Logger = None)
     return best_exp_dir
 
 
-def load_phone_embed(config: LatticeBartConfig, args: Namespace, logger: Logger = None):
-    if logger:
-        logger.info(f"Load pretrained phone embedding from {args.phone_embed_path}")
-
-    phone_map = stressed_phone_map if args.phone_embed == "stressed" else unstressed_phone_map
-    phone_embed = torch.zeros(len(phone_map), config.d_model)
-    phone_embed.data.normal_(0, std=config.init_std)
-
-    # noinspection PyTypeChecker
-    wv: KeyedVectors = KeyedVectors.load(args.phone_embed_path)
-
-    for token, token_id in phone_map.items():
-        if token not in wv.key_to_index:
-            continue
-        phone_embed[token_id] = torch.FloatTensor(wv.get_vector(token, norm=True).copy())
-
-    return phone_embed
-
-
 def get_encoder_and_tokenizer(args: Namespace, logger: Logger, to_device):
     ckpt_dir = select_best_checkpoint(args.exp_dir, use_metric=args.use_metric, logger=logger)
     if ckpt_dir is not None:
@@ -168,14 +147,11 @@ def get_encoder_and_tokenizer(args: Namespace, logger: Logger, to_device):
     else:
         if args.default_config is not None:
             config = get_model_config(args.default_config)
-            config.phone_embed = args.phone_embed
             encoder = LatticeBart(config).get_encoder()
             tokenizer = get_tokenizer()
 
         elif args.bart_path is not None:
-            encoder = LatticeBart.from_bart(
-                bart_path=args.bart_path, lat_enc_layers=args.lat_enc_layers, phone_embed=args.phone_embed
-            ).get_encoder()
+            encoder = LatticeBart.from_bart(bart_path=args.bart_path, lat_enc_layers=args.lat_enc_layers).get_encoder()
             tokenizer = BartTokenizer.from_pretrained(args.bart_path)
 
         elif args.lat_bart_path is not None:
@@ -187,15 +163,10 @@ def get_encoder_and_tokenizer(args: Namespace, logger: Logger, to_device):
                 logger.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
             raise ValueError("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
 
-        # Load pretrained phoneme embedding
-        if args.phone_embed != "none" and os.path.exists(args.phone_embed_path):
-            phone_embed = load_phone_embed(config=encoder.config, args=args, logger=logger)
-            encoder.phone_embed.weight.data = phone_embed.to(encoder.device)
-
         if args.init_model:
             if logger:
                 logger.info("[!] Initialize model parameters.")
-            model_init(encoder, std=encoder.config.init_std, except_modules=(encoder.embed_tokens, encoder.phone_embed))
+            model_init(encoder, std=encoder.config.init_std, except_modules=(encoder.embed_tokens,))
 
         encoder = EncoderWrapper(encoder)
 
@@ -434,7 +405,7 @@ def training(encoder: Union[EncoderWrapper, DP, DDP], tokenizer: BartTokenizer, 
             )
             metric = metrics[args.use_metric]
 
-            if mtc.metric_is_better_than_ever(metric):
+            if mtc.metric_is_better_than_ever(metric) or args.always_save:
                 save_checkpoint(epoch=epoch, model=encoder, metric=metric, optimizer=optimizer,
                                 tokenizer=tokenizer, runtime_metric=mtc, args=args, logger=logger)
 
@@ -483,8 +454,7 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
         batch_size = args.train_batch
         num_workers = args.num_workers
 
-    collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1),
-                           phone_embed=args.phone_embed).collate_fn
+    collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1)).collate_fn
 
     train_loader = DataLoader(
         trainset, batch_size=batch_size, shuffle=False if _use_DDP else True, num_workers=num_workers,
@@ -572,8 +542,7 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
         if logger:
             logger.info("======== Start testing ========")
 
-        collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1),
-                               phone_embed=args.phone_embed).collate_fn
+        collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1)).collate_fn
 
         for i, testset in enumerate(testsets):
             test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,

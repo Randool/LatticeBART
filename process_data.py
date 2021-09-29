@@ -22,8 +22,7 @@ def main():
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
         use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
-        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
-        homophone_replace=args.homophone_replace
+        use_lattice_mask=args.use_lattice_mask, homophone_replace=args.homophone_replace
     )
 
     if (args.train_lat is not None) or (args.train_text is not None):

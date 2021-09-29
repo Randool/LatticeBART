@@ -5,15 +5,15 @@ from typing import Optional, Iterable, Callable, List
 
 import torch
 import torch.nn as nn
-from torch import Tensor
 from torch.nn import CrossEntropyLoss
 from transformers import BartForConditionalGeneration, BeamSearchScorer
 from transformers.file_utils import ModelOutput
 from transformers.modeling_outputs import Seq2SeqModelOutput, Seq2SeqLMOutput
-from transformers.models.bart.modeling_bart import BartDecoder, BartPretrainedModel
+from transformers.models.bart.modeling_bart import BartPretrainedModel
 
 from utils.utils import log
 from .config import LatticeBartConfig
+from .decoder import LatticeDecoder
 from .encoder import LatticeEncoder
 
 
@@ -26,7 +26,7 @@ class LatticeBartBase(BartPretrainedModel):
 
         self.shared = nn.Embedding(config.vocab_size, config.d_model, config.pad_token_id)
         self.encoder = LatticeEncoder(config, self.shared)
-        self.decoder = BartDecoder(config, self.shared)
+        self.decoder = LatticeDecoder(config, self.shared)
 
         self.init_weights()
 
@@ -45,18 +45,14 @@ class LatticeBartBase(BartPretrainedModel):
         return self.decoder
 
     # LatticeBartBase
-    def forward(self, input_ids=None, appendix=None, phone_ids=None, phone_appendix=None, min_depth=None,
-                max_depth=None, lattice_mask=None, forward_backward=None, marginals=None, enc_dec_attention_mask=None,
-                encoder_outputs=None, past_key_values=None, decoder_input_ids=None, decoder_attention_mask=None,
-                use_cache=True, output_attentions=False, output_hidden_states=False, return_dict=True,
-                batch_idx: Tensor = None):
+    def forward(self, input_ids=None, min_depth=None, max_depth=None, lattice_mask=None, forward_backward=None,
+                marginals=None, enc_dec_attention_mask=None, encoder_outputs=None, past_key_values=None,
+                decoder_input_ids=None, decoder_attention_mask=None, decoder_min_depth=None, decoder_max_depth=None,
+                use_cache=True, output_attentions=False, output_hidden_states=False, return_dict=True):
         # Encoder forward
         if encoder_outputs is None:
             encoder_outputs = self.encoder.forward(
                 input_ids=input_ids,
-                appendix=appendix,
-                phone_ids=phone_ids,
-                phone_appendix=phone_appendix,
                 min_depth=min_depth,
                 max_depth=max_depth,
                 lattice_mask=lattice_mask,
@@ -65,7 +61,6 @@ class LatticeBartBase(BartPretrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
-                batch_idx=batch_idx
             )
 
             if enc_dec_attention_mask is None:
@@ -75,6 +70,8 @@ class LatticeBartBase(BartPretrainedModel):
         decoder_outputs = self.decoder.forward(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
+            min_depth=decoder_min_depth,
+            max_depth=decoder_max_depth,
             encoder_hidden_states=encoder_outputs[0],
             encoder_attention_mask=enc_dec_attention_mask,
             past_key_values=past_key_values,
@@ -129,16 +126,13 @@ class LatticeBart(BartPretrainedModel):
         self.lm_head = new_embeddings
 
     # LatticeBart
-    def forward(self, input_ids=None, appendix=None, phone_ids=None, phone_appendix=None, min_depth=None,
-                max_depth=None, lattice_mask=None, forward_backward=None, marginals=None, enc_dec_attention_mask=None,
-                encoder_outputs=None, past_key_values=None, decoder_input_ids=None, decoder_attention_mask=None,
+    def forward(self, input_ids=None, min_depth=None, max_depth=None, lattice_mask=None, forward_backward=None,
+                marginals=None, enc_dec_attention_mask=None, encoder_outputs=None, past_key_values=None,
+                decoder_input_ids=None, decoder_attention_mask=None, decoder_min_depth=None, decoder_max_depth=None,
                 labels=None, use_cache=True, output_attentions=False, output_hidden_states=False, return_dict=True,
-                batch_idx: Tensor = None, reduction="mean"):
+                reduction="mean"):
         outputs = self.model.forward(
             input_ids=input_ids,
-            appendix=appendix,
-            phone_ids=phone_ids,
-            phone_appendix=phone_appendix,
             min_depth=min_depth,
             max_depth=max_depth,
             lattice_mask=lattice_mask,
@@ -149,17 +143,22 @@ class LatticeBart(BartPretrainedModel):
             past_key_values=past_key_values,
             decoder_input_ids=decoder_input_ids,
             decoder_attention_mask=decoder_attention_mask,
+            decoder_min_depth=decoder_min_depth,
+            decoder_max_depth=decoder_max_depth,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            batch_idx=batch_idx
         )
-        lm_logits = self.lm_head(outputs[0]) + self.final_logits_bias
+        lm_logits = self.lm_head(outputs.last_hidden_state) + self.final_logits_bias
 
         masked_lm_loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss(reduction=reduction)
+            # print(lm_logits.shape)
+            # print(torch.where(torch.isnan(lm_logits)))
+            # print(labels.shape)
+            # print(labels)
             masked_lm_loss = loss_fct(lm_logits.view(-1, self.config.vocab_size), labels.view(-1))
 
         if not return_dict:
@@ -200,7 +199,7 @@ class LatticeBart(BartPretrainedModel):
         return lattice_bart
 
     @classmethod
-    def from_bart(cls, bart_path: str, lat_enc_layers: int, phone_embed: str):
+    def from_bart(cls, bart_path: str, lat_enc_layers: int):
         bart = BartForConditionalGeneration.from_pretrained(bart_path)
         config = bart.config.to_dict()
 
@@ -209,7 +208,6 @@ class LatticeBart(BartPretrainedModel):
             f"bart.config.encoder_layers({bart.config.encoder_layers})"
 
         config["lat_enc_layers"] = lat_enc_layers
-        config["phone_embed"] = phone_embed
         lattice_bart = cls(LatticeBartConfig.from_dict(config))
 
         # Move parameters from pretrained bart
@@ -257,8 +255,7 @@ class LatticeBart(BartPretrainedModel):
 
     @torch.no_grad()
     def generate(
-            self, input_ids, appendix, min_depth, max_depth, lattice_mask,
-            phone_ids=None, phone_appendix=None,
+            self, input_ids, min_depth, max_depth, lattice_mask,
             forward_backward=None, marginals=None,
             max_length: Optional[int] = None,
             min_length: Optional[int] = None,
@@ -285,7 +282,6 @@ class LatticeBart(BartPretrainedModel):
             output_hidden_states: Optional[bool] = None,
             output_scores: Optional[bool] = None,
             return_dict_in_generate: Optional[bool] = None,
-            batch_idx: Tensor = None,
             **model_kwargs,
     ):
         # set init values
@@ -309,10 +305,9 @@ class LatticeBart(BartPretrainedModel):
         model_kwargs["enc_dec_attention_mask"] = input_ids.ne(pad_token_id).long()
 
         model_kwargs["encoder_outputs"] = self.model.encoder.forward(
-            input_ids=input_ids, appendix=appendix, phone_ids=phone_ids, phone_appendix=phone_appendix,
-            min_depth=min_depth, max_depth=max_depth, lattice_mask=lattice_mask, forward_backward=forward_backward,
-            marginals=marginals, output_attentions=output_attentions, output_hidden_states=output_hidden_states,
-            batch_idx=batch_idx
+            input_ids=input_ids, min_depth=min_depth, max_depth=max_depth, lattice_mask=lattice_mask,
+            forward_backward=forward_backward, marginals=marginals, output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
         )
 
         # set input_ids as decoder_input_ids

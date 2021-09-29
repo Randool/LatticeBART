@@ -1,11 +1,13 @@
 import logging
 import sys
 from collections import namedtuple
-from typing import Dict, Tuple
+from itertools import accumulate
+from typing import Dict, Tuple, List
 
 import networkx as nx
 import numpy as np
 import torch
+from transformers import BartTokenizer
 
 from dataset.symbols import *
 from dataset.utils import dump_graph
@@ -112,32 +114,45 @@ def min_max_depth(G: nx.DiGraph, topo_order: list = None) -> Tuple[dict, dict]:
     return min_depths, max_depths
 
 
-def mtx_relative_position(L: nx.DiGraph) -> torch.Tensor:
+def mtx_relative_position(L: nx.DiGraph, token_len: List[int] = None) -> torch.Tensor:
     assert all(isinstance(node, int) for node in L.nodes), "All node_id should be map to int"
+
+    if token_len is None:
+        token_len = [1] * len(L)
+    _len = sum(token_len)
+    start_id = [0] + list(accumulate(token_len))
+
     distance = nx.all_pairs_shortest_path_length(L)
-    mtx = torch.zeros(len(L), len(L), dtype=torch.int).fill_(torch.iinfo(torch.int).min)
+    mtx = torch.zeros(_len, _len, dtype=torch.int).fill_(torch.iinfo(torch.int).min)
     for i, succs in distance:
         for j, d in succs.items():
-            mtx[i, j] = d
-            mtx[j, i] = -d
+            i_start, i_end = start_id[i], start_id[i + 1]
+            j_start, j_end = start_id[j], start_id[j + 1]
+            mtx[i_start: i_end, j_start: j_end] = d
+            mtx[j_start: j_end, i_start: i_end] = -d
+
     return mtx
 
 
-def binary_reachability_mask(L: nx.DiGraph):
-    relation = mtx_relative_position(L)
+def binary_reachability_mask(L: nx.DiGraph, token_len: List[int] = None):
+    relation = mtx_relative_position(L, token_len)
     return relation.ne(torch.iinfo(torch.int).min).long()
 
 
-def probabilistic_reachability_mask(L: nx.DiGraph) -> torch.FloatTensor:
-    raise NotImplementedError
+def mtx_transfer(L: nx.DiGraph, token_len: List[int] = None) -> torch.Tensor:
+    if token_len is None:
+        token_len = [1] * len(L)
+    _len = sum(token_len)
+    mtx = torch.zeros(_len, _len, dtype=torch.float)
+    start_id = [0] + list(accumulate(token_len))
 
-
-def mtx_transfer(L: nx.DiGraph) -> torch.Tensor:
-    mtx = torch.zeros(len(L), len(L), dtype=torch.float)
     for i in L:
         for j, attrs in L[i].items():
-            mtx[i, j] = attrs["f"]
-            mtx[j, i] = attrs["b"]
+            i_start, i_end = start_id[i], start_id[i + 1]
+            j_start, j_end = start_id[j], start_id[j + 1]
+            mtx[i_start: i_end, j_start: j_end] = attrs["f"]
+            mtx[j_start: j_end, i_start: i_end] = attrs["b"]
+
     return mtx
 
 
@@ -242,12 +257,12 @@ def parse_lattice_from_address(lattice_addr: str, to_line_graph=True, lower_case
                           lm_scale=lm_scale, ac_scale=ac_scale)
 
 
-LAT_INFO = namedtuple("LAT_INFO", ("words", "marginal", "min_depth", "max_depth", "fb", "mask"))
+LAT_INFO = namedtuple("LAT_INFO", ("token_ids", "marginal", "min_depth", "max_depth", "fb", "mask"))
 
 
-def line_graph_process(L: nx.DiGraph, use_marginal=True, min_depth=True, max_depth=True, forward_backward=True,
-                       use_lattice_mask=True, binary_mask=True) -> LAT_INFO:
-    """ Lattice -> LAT_INFO """
+def line_graph_process(L: nx.DiGraph, tokenizer: BartTokenizer, use_marginal=True, use_min_depth=True,
+                       use_max_depth=True, use_forward_backward=True, use_lattice_mask=True) -> LAT_INFO:
+    """ 将Digraph转为LAT_INFO，并且包含了token的展开 """
     assert all(isinstance(node, int) for node in L.nodes), "All node_id should be map to int"
     node_order = list(nx.topological_sort(L))
 
@@ -255,26 +270,30 @@ def line_graph_process(L: nx.DiGraph, use_marginal=True, min_depth=True, max_dep
     L = scoring_line_graph(L, node_order)
     nodes = L.nodes
 
-    words = []
+    token_ids = []
+    token_len = []
     marginals = [] if use_marginal else None
+    min_depth = [] if use_min_depth else None
+    max_depth = [] if use_max_depth else None
 
-    for i in range(len(L)):
-        node_attr = nodes[i]
-        words.append(node_attr["word"])
+    _min_depth, _max_depth = min_max_depth(L, node_order) if (use_min_depth and use_max_depth) else (None, None)
+
+    for n in range(len(L)):
+        node_attr = nodes[n]
+        word = node_attr["word"]
+        ids = tokenizer.encode(word, add_prefix_space=word not in special_tokens, add_special_tokens=False)
+        token_ids.extend(ids)
+        _len = len(ids)
+        token_len.append(_len)
+
         if use_marginal:
-            marginals.append(node_attr["m"])
+            marginals.extend([node_attr["m"]] * _len)
+        if use_min_depth:
+            min_depth.extend([_min_depth[n]] * _len)
+        if use_max_depth:
+            max_depth.extend([_max_depth[n]] * _len)
 
-    _min_depth, _max_depth = min_max_depth(L, node_order)
-    _min_depth = [_min_depth[n] for n in range(len(L))] if min_depth else None
-    _max_depth = [_max_depth[n] for n in range(len(L))] if max_depth else None
-    fb_mtx = mtx_transfer(L) if forward_backward else None
+    fb_mtx = mtx_transfer(L, token_len) if use_forward_backward else None
+    lattice_mask = binary_reachability_mask(L, token_len) if use_lattice_mask else None
 
-    if use_lattice_mask:
-        if binary_mask:
-            lattice_mask = binary_reachability_mask(L)
-        else:
-            lattice_mask = probabilistic_reachability_mask(L)
-    else:
-        lattice_mask = None
-
-    return LAT_INFO(" ".join(words), marginals, _min_depth, _max_depth, fb_mtx, lattice_mask)
+    return LAT_INFO(token_ids, marginals, min_depth, max_depth, fb_mtx, lattice_mask)

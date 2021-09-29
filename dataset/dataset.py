@@ -3,6 +3,7 @@ import os
 import pickle
 import random
 from collections import namedtuple
+from copy import deepcopy
 from os.path import exists, join, split
 from typing import Union, Dict, Any, List
 
@@ -12,10 +13,9 @@ from torch import Tensor
 from torch.utils.data.dataset import Dataset
 from transformers import BartTokenizer, BatchEncoding
 
-from dataset.parse import parse_lattice_file, line_graph_process, parse_lattice_from_address
-from utils.args import PHONE_EMBED_CHOICE
+from dataset.symbols import MASK
+from dataset.parse import parse_lattice_file, line_graph_process, parse_lattice_from_address, LAT_INFO
 from utils.phone import HomophoneReplacer
-from utils.tokenizer import word_based_tokenize
 
 MAX_NODEs = int(1e3)
 
@@ -83,11 +83,9 @@ class _LatticeDataset(_KeyBased):
                 filename = join(cache_dir, f"{split(file)[-1]}.cache")
                 if exists(filename):
                     _lattices = _load_cache(filename)
-                    # log(f"Load {len(_lattices)} lattices from {filename}.", logger)
                 else:
                     _lattices = self._load_and_filter(file, min_nodes, max_nodes, lower_case, lm_scale, ac_scale)
                     _cache_data(_lattices, filename)
-                    # log(f"Cache {len(_lattices)} lattices to {filename}.", logger)
             else:
                 _lattices = self._load_and_filter(file, min_nodes, max_nodes, lower_case, lm_scale, ac_scale)
 
@@ -112,7 +110,7 @@ class _LatticeDataset(_KeyBased):
         for lattice_id, lat in list(_lattices.items()):
             if len(lat) < min_nodes or len(lat) > max_nodes:
                 del _lattices[lattice_id]
-        # logger.info(f"Load {len(_lattices)} lattices from {file}.")
+
         return _lattices
 
 
@@ -196,10 +194,11 @@ class TextDataset(__TextDataset):
 
 DataProcessCfg = namedtuple("DataProcessCfg", (
     "min_nodes", "max_nodes", "lower_case", "ac_scale", "lm_scale", "use_marginal", "use_min_depth",
-    "use_max_depth", "use_forward_backward", "use_lattice_mask", "binary_mask", "homophone_replace"
+    "use_max_depth", "use_forward_backward", "use_lattice_mask", "homophone_replace", "token_mask",
+    "depth_disturb"
 ))
 
-_default_cfg = DataProcessCfg(1, 200, True, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0)
+_default_cfg = DataProcessCfg(1, 200, True, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, 0, 0)
 
 
 class LatticeTextDataset(Dataset):
@@ -252,14 +251,13 @@ class LatticeTextDataset(Dataset):
 
 
 class CollateFn:
-    def __init__(self, tokenizer: BartTokenizer, n_lat=1, return_keys=False, phone_embed="none",
+    def __init__(self, tokenizer: BartTokenizer, decoder_input, n_lat=1, return_keys=False,
                  process_cfg: DataProcessCfg = _default_cfg):
-        assert phone_embed in PHONE_EMBED_CHOICE
-
+        assert decoder_input in ("sent", "lattice"), f"Unsupported value: {decoder_input}"
         self.tokenizer = tokenizer
         self.n_lat = n_lat
         self.return_keys = return_keys
-        self.phone_embed = phone_embed
+        self.decoder_input = decoder_input  # The input of enc and dec are both lattice
         self.process_cfg = process_cfg
 
         self.homophone_replacer = HomophoneReplacer() if process_cfg.homophone_replace > 0 else None
@@ -281,11 +279,15 @@ class CollateFn:
         return _mats
 
     def collate_fn(self, batch_data: list) -> dict:
+        if self.decoder_input == "sent":
+            return self.collate_fn_for_lat2sent(batch_data)
+        return self.collate_fn_for_lat2lat(batch_data)
+
+    def collate_fn_for_lat2sent(self, batch_data: list) -> dict:
         process_cfg = self.process_cfg
 
         keys = []
-
-        batch_input_seqs = []
+        batch_input_ids = []
         batch_min_depth = []
         batch_max_depth = []
         batch_lat_mask = []
@@ -306,69 +308,175 @@ class CollateFn:
             # Process nx.Digraph-formatted lattice
             for i in idx:
                 lat = lats[i]
-                if isinstance(lat, nx.DiGraph):
+
+                if not isinstance(lat, LAT_INFO):
+                    # ark format: <file>:<bias>:<delta>
+                    if isinstance(lat, str):
+                        lattice_id, lat = parse_lattice_from_address(lat, to_line_graph=True,
+                                                                     lower_case=process_cfg.lower_case,
+                                                                     lm_scale=process_cfg.lm_scale,
+                                                                     ac_scale=process_cfg.ac_scale)
+                        # `key.startswith(lattice_id)` is used when do contrastive learning
+                        assert lattice_id == key or key.startswith(lattice_id), \
+                            f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
+
+                    assert isinstance(lat, nx.DiGraph), f"Suppose `nx.DigGraph` lat, got {type(lat)}"
+
+                    # Replace homophone in nodes
+                    if self.homophone_replacer is not None:
+                        nodes = lat.nodes
+                        for n in nodes:
+                            if random.random() <= process_cfg.homophone_replace:
+                                homophones = self.homophone_replacer.find_homophones(nodes[n]["word"])
+                                if homophones:
+                                    nodes[n]["word"] = random.choice(homophones)
+
                     lat = line_graph_process(
-                        lat, use_marginal=(random.random() <= process_cfg.use_marginal),
-                        min_depth=(random.random() <= process_cfg.use_min_depth),
-                        max_depth=(random.random() <= process_cfg.use_max_depth),
-                        forward_backward=(random.random() <= process_cfg.use_forward_backward),
-                        use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
-                        binary_mask=(random.random() <= process_cfg.binary_mask)
-                    )
-                elif isinstance(lat, str):  # ark format: <file>:<bias>:<delta>
-                    lattice_id, lat = parse_lattice_from_address(lat, to_line_graph=True,
-                                                                 lower_case=process_cfg.lower_case,
-                                                                 lm_scale=process_cfg.lm_scale,
-                                                                 ac_scale=process_cfg.ac_scale)
-
-                    # `key.startswith(lattice_id)` is used when do contrastive learning
-                    assert lattice_id == key or key.startswith(lattice_id), \
-                        f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
-
-                    lat = line_graph_process(
-                        lat, use_marginal=(random.random() <= process_cfg.use_marginal),
-                        min_depth=(random.random() <= process_cfg.use_min_depth),
-                        max_depth=(random.random() <= process_cfg.use_max_depth),
-                        forward_backward=(random.random() <= process_cfg.use_forward_backward),
-                        use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask),
-                        binary_mask=(random.random() <= process_cfg.binary_mask)
+                        lat, tokenizer=self.tokenizer,
+                        use_marginal=(random.random() <= process_cfg.use_marginal),
+                        use_min_depth=(random.random() <= process_cfg.use_min_depth),
+                        use_max_depth=(random.random() <= process_cfg.use_max_depth),
+                        use_forward_backward=(random.random() <= process_cfg.use_forward_backward),
+                        use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask)
                     )
 
-                input_text, marginal, min_depth, max_depth, fb, lattice_mask = lat
-                batch_input_seqs.append(input_text)
+                input_ids, marginal, min_depth, max_depth, fb, lattice_mask = lat
+                batch_input_ids.append(input_ids)
                 batch_min_depth.append(min_depth)
                 batch_max_depth.append(max_depth)
                 batch_lat_mask.append(lattice_mask)
                 batch_fb.append(fb)
                 batch_marginal.append(marginal)
 
-        # Replace homophone
-        if self.homophone_replacer is not None:
-            batch_input_seqs = [
-                self.homophone_replacer.process_sent(s, ratio=process_cfg.homophone_replace) for s in
-                batch_input_seqs
-            ]
+        max_len = max(map(len, batch_input_ids))
+        mat_shape = (max_len, max_len)
 
-        inputs = word_based_tokenize(batch_input_seqs, self.tokenizer, lower=True, return_attention=False,
-                                     to_tensor=True, phone_embed=self.phone_embed)
+        inputs = {
+            "input_ids": self.padding_seqs(batch_input_ids, self.tokenizer.pad_token_id, max_len, torch.long),
+            "min_depth": self.padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long),
+            "max_depth": self.padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long),
+            "lattice_mask": self.padding_mats(batch_lat_mask, 0, mat_shape, torch.long),
+            "marginals": self.padding_seqs(batch_marginal, 0, max_len, torch.float),
+            "forward_backward": self.padding_mats(batch_fb, 0, mat_shape, torch.float),
+        }
 
         if self.return_keys:
             inputs["key"] = keys
 
-        B, max_len = inputs["input_ids"].shape
-        mat_shape = (max_len, max_len)
-
-        inputs["min_depth"] = self.padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long)
-        inputs["max_depth"] = self.padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long)
-        inputs["lattice_mask"] = self.padding_mats(batch_lat_mask, 0, mat_shape, torch.long)
-        inputs["marginals"] = self.padding_seqs(batch_marginal, 0, max_len, torch.float)
-        inputs["forward_backward"] = self.padding_mats(batch_fb, 0, mat_shape, torch.float)
-        inputs["batch_idx"] = torch.arange(B, dtype=torch.long)
-
-        if batch_texts[0] is not None:
+        if batch_texts and batch_texts[0] is not None:
             outputs = self.tokenizer.batch_encode_plus(batch_texts, padding=True, return_tensors="pt")
             inputs["decoder_input_ids"] = outputs["input_ids"][:, :-1].contiguous()
             inputs["decoder_attention_mask"] = outputs["attention_mask"][:, :-1].contiguous()
             inputs["labels"] = outputs["input_ids"][:, 1:].contiguous()
+
+        return inputs
+
+    def collate_fn_for_lat2lat(self, batch_data: list) -> dict:
+        process_cfg = self.process_cfg
+        keys = []
+        # Encoder inputs
+        batch_input_ids = []
+        batch_min_depth = []
+        batch_max_depth = []
+        batch_lat_mask = []
+        batch_fb = []
+        batch_marginal = []
+        # Decoder inputs
+        batch_dec_input_ids = []
+        batch_dec_min_depth = []
+        batch_dec_max_depth = []
+        batch_dec_lat_mask = []
+
+        for key, lats, _text in batch_data:
+            if self.return_keys:
+                keys.append(key)
+
+            idx = [i % len(lats) for i in range(max(len(lats), self.n_lat))]  # Padding lats if not enough
+            random.shuffle(idx)
+            idx = idx[:self.n_lat]
+
+            for i in idx:
+                lat = lats[i]
+                # ark format: <file>:<bias>:<delta>
+                if isinstance(lat, str):
+                    lattice_id, lat = parse_lattice_from_address(lat, to_line_graph=True,
+                                                                 lower_case=process_cfg.lower_case,
+                                                                 lm_scale=process_cfg.lm_scale,
+                                                                 ac_scale=process_cfg.ac_scale)
+                    # `key.startswith(lattice_id)` is used when do contrastive learning
+                    assert lattice_id == key or key.startswith(lattice_id), \
+                        f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
+
+                assert isinstance(lat, nx.DiGraph), f"Suppose `nx.DigGraph` lat, got {type(lat)}"
+
+                # The lattices fed into encoder and decoder are different.
+                lat_enc, lat_dec = lat, deepcopy(lat)
+
+                # Replace homophone or mask token in nodes of encoder lattices
+                if self.homophone_replacer is not None or process_cfg.token_mask > 0:
+                    nodes = lat_enc.nodes
+                    for n in nodes:
+                        if random.random() <= process_cfg.max_nodes:
+                            nodes[n]["word"] = MASK
+                            continue
+
+                        if random.random() <= process_cfg.homophone_replace:
+                            homophones = self.homophone_replacer.find_homophones(nodes[n]["word"])
+                            if homophones:
+                                nodes[n]["word"] = random.choice(homophones)
+
+                lat_enc_info = line_graph_process(
+                    lat_enc, tokenizer=self.tokenizer,
+                    use_marginal=(random.random() <= process_cfg.use_marginal),
+                    use_min_depth=(random.random() <= process_cfg.use_min_depth),
+                    use_max_depth=(random.random() <= process_cfg.use_max_depth),
+                    use_forward_backward=(random.random() <= process_cfg.use_forward_backward),
+                    use_lattice_mask=(random.random() <= process_cfg.use_lattice_mask)
+                )
+                input_ids, marginal, min_depth, max_depth, fb, mask = lat_enc_info
+                depth_disturb = random.randint(0, process_cfg.depth_disturb)
+                batch_input_ids.append(input_ids)
+                batch_min_depth.append(min_depth + depth_disturb if (min_depth is not None) else None)
+                batch_max_depth.append(max_depth + depth_disturb if (max_depth is not None) else None)
+                batch_lat_mask.append(mask)
+                batch_fb.append(fb)
+                batch_marginal.append(marginal)
+
+                lat_dec_info = line_graph_process(
+                    lat_dec, tokenizer=self.tokenizer, use_marginal=False, use_min_depth=True, use_max_depth=True,
+                    use_forward_backward=False, use_lattice_mask=True
+                )
+                input_ids, _marginal, min_depth, max_depth, _fb, mask = lat_dec_info
+                batch_dec_input_ids.append(input_ids)
+                batch_dec_min_depth.append(min_depth)
+                batch_dec_max_depth.append(max_depth)
+                batch_dec_lat_mask.append(mask)
+
+        # Group
+        max_len = max(map(len, batch_input_ids))
+        mat_shape = (max_len, max_len)
+
+        dec_max_len = max(map(len, batch_dec_input_ids))
+        dec_mat_shape = (dec_max_len, dec_max_len)
+
+        dec_inputs = self.padding_seqs(batch_dec_input_ids, self.tokenizer.pad_token_id, dec_max_len, torch.long)
+        dec_mask = self.padding_mats(batch_dec_lat_mask, 0, dec_mat_shape, torch.long)
+
+        inputs = {
+            "input_ids": self.padding_seqs(batch_input_ids, self.tokenizer.pad_token_id, max_len, torch.long),
+            "lattice_mask": self.padding_mats(batch_lat_mask, 0, mat_shape, torch.long),
+            "min_depth": self.padding_seqs(batch_min_depth, MAX_NODEs, max_len, torch.long),
+            "max_depth": self.padding_seqs(batch_max_depth, MAX_NODEs, max_len, torch.long),
+            "marginals": self.padding_seqs(batch_marginal, 0, max_len, torch.float),
+            "forward_backward": self.padding_mats(batch_fb, 0, mat_shape, torch.float),
+
+            "decoder_input_ids": dec_inputs[:, :-1].contiguous(),
+            "decoder_attention_mask": dec_mask[:, :-1, :-1].contiguous(),
+            "decoder_min_depth": self.padding_seqs(batch_dec_min_depth, MAX_NODEs, dec_max_len, torch.long),
+            "decoder_max_depth": self.padding_seqs(batch_dec_max_depth, MAX_NODEs, dec_max_len, torch.long),
+            "labels": dec_inputs[:, 1:].contiguous(),
+        }
+        if self.return_keys:
+            inputs["key"] = keys
 
         return inputs

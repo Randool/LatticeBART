@@ -6,12 +6,11 @@ from os.path import join
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor, LongTensor
+from torch import Tensor
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bart.modeling_bart import BartEncoderLayer
 
-from utils.phone import unstressed_phone_map, stressed_phone_map
 from .config import LatticeBartConfig
 
 
@@ -171,14 +170,6 @@ class LatticeEncoder(nn.Module):
 
         self.embed_positions = nn.Embedding(config.max_position_embeddings + 2, embed_dim, self.padding_idx)
 
-        # Phoneme embedding
-        if config.phone_embed == "none":
-            self.phone_embed = None
-        elif config.phone_embed == "unstressed":
-            self.phone_embed = nn.Embedding(len(unstressed_phone_map), embed_dim)
-        else:
-            self.phone_embed = nn.Embedding(len(stressed_phone_map), embed_dim)
-
         self.marginal_proj = nn.Linear(1, embed_dim)
         self.lattice_layers = nn.ModuleList([LatticeEncoderLayer(config) for _ in range(config.lat_enc_layers)])
 
@@ -187,40 +178,14 @@ class LatticeEncoder(nn.Module):
         )
         self.layernorm_embedding = nn.LayerNorm(embed_dim)
 
-    def prepare_embeds(self, embed: nn.Embedding, input_ids: LongTensor, appendix: dict = None,
-                       batch_idx: LongTensor = None):
-        inputs_embeds = embed(input_ids)
-
-        # When distributed training, `batch_idx` will not be None
-        min_idx, max_idx = 0, input_ids.shape[0] - 1
-        if batch_idx is not None:
-            min_idx, max_idx = batch_idx[0].item(), batch_idx[-1].item()
-
-        # Add appendix
-        if appendix is not None:
-            for i, chunks in appendix.items():
-                if i < min_idx or max_idx < i:
-                    continue
-                i -= min_idx
-                for j, ids in chunks.items():
-                    _ids = torch.tensor(ids, dtype=torch.long, device=input_ids.device)
-                    _chunk_embed = embed(_ids).sum(dim=0)
-                    inputs_embeds[i, j] = (inputs_embeds[i, j] + _chunk_embed) / (len(ids) + 1)
-        inputs_embeds = inputs_embeds * self.embed_scale
-        return inputs_embeds
-
     def _pos_embedding(self, pos: Tensor):
         pos = torch.clamp(pos + 2, 0, self.config.max_position_embeddings - 1)
         return self.embed_positions(pos)
 
-    def forward(self, input_ids, appendix=None, phone_ids=None, phone_appendix=None, min_depth=None, max_depth=None,
-                lattice_mask=None, forward_backward=None, marginals=None, output_attentions=False,
-                output_hidden_states=False, return_dict=True, batch_idx: Tensor = None):
+    def forward(self, input_ids, min_depth=None, max_depth=None, lattice_mask=None, forward_backward=None,
+                marginals=None, output_attentions=False, output_hidden_states=False, return_dict=True):
         """
         :param input_ids:       LongTensor. [B, S]
-        :param appendix:        dict
-        :param phone_ids:       LongTensor. [B, S]
-        :param phone_appendix:  dict
         :param min_depth:       LongTensor. [B, S]
         :param max_depth:       LongTensor. [B, S]
         :param lattice_mask:        LongTensor or FloatTensor. [B, S, S]. {0, 1}
@@ -229,18 +194,12 @@ class LatticeEncoder(nn.Module):
         :param output_attentions:   bool
         :param output_hidden_states: bool
         :param return_dict:         bool
-        :param batch_idx:       LongTensor. Used when train model in distributed fashion
         """
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
         # Word embedding
-        inputs_embeds = self.prepare_embeds(embed=self.embed_tokens, input_ids=input_ids,
-                                            appendix=appendix, batch_idx=batch_idx)
-        if phone_ids is not None:
-            phone_embeds = self.prepare_embeds(embed=self.phone_embed, input_ids=phone_ids,
-                                               appendix=phone_appendix, batch_idx=batch_idx)
-            inputs_embeds = inputs_embeds + phone_embeds
+        inputs_embeds = self.embed_tokens(input_ids)
 
         # Positional embedding
         if min_depth is None and max_depth is None:

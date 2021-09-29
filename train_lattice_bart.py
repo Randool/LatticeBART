@@ -2,7 +2,6 @@
 Training pipeline of LatticeBart
 """
 import argparse
-from inspect import signature
 from logging import Logger
 from math import ceil, floor
 from os.path import exists
@@ -20,12 +19,8 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import BartTokenizer, get_cosine_schedule_with_warmup
 
 from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, CollateFn
-from models.config import get_model_config, get_tokenizer
-from models.encoder import LatticeEncoder
-from models.lattice_bart import LatticeBart
-from models.model_utils import model_init
-from train_lattice_encoder import save_checkpoint, select_best_checkpoint, cos_similarity_mtx, contrastive_loss, \
-    config_optimizer, wrap_distributed_parallel, load_phone_embed
+from models import get_model_config, get_tokenizer, LatticeEncoder, LatticeBart, model_init
+from train_lattice_encoder import save_checkpoint, select_best_checkpoint, config_optimizer, wrap_distributed_parallel
 from utils.args import *
 from utils.metric import WER, BLEU
 from utils.utils import set_seed, RuntimeMetric, use_DP, use_DDP, setup_dist_environment, \
@@ -59,13 +54,13 @@ def prepare_datasets(args: Namespace, logger: Logger):
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=args.use_marginal, use_min_depth=args.use_min_depth,
         use_max_depth=args.use_max_depth, use_forward_backward=args.use_forward_backward,
-        use_lattice_mask=args.use_lattice_mask, binary_mask=args.use_binary_mask,
-        homophone_replace=args.homophone_replace
+        use_lattice_mask=args.use_lattice_mask, homophone_replace=args.homophone_replace,
+        token_mask=args.token_mask, depth_disturb=args.depth_disturb,
     )
     process_cfg_for_test = DataProcessCfg(
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
         lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
-        use_lattice_mask=1, binary_mask=1, homophone_replace=0
+        use_lattice_mask=1, homophone_replace=0, token_mask=0, depth_disturb=0,
     )
 
     trainset, devset, testsets = None, None, []
@@ -116,14 +111,11 @@ def get_model_and_tokenizer(args: Namespace, logger: Logger, to_device):
     else:
         if args.default_config is not None:
             config = get_model_config(args.default_config)
-            config.phone_embed = args.phone_embed
             model = LatticeBart(config)
             tokenizer = get_tokenizer()
 
         elif args.bart_path is not None:
-            model = LatticeBart.from_bart(
-                bart_path=args.bart_path, lat_enc_layers=args.lat_enc_layers, phone_embed=args.phone_embed
-            )
+            model = LatticeBart.from_bart(bart_path=args.bart_path, lat_enc_layers=args.lat_enc_layers)
             tokenizer = BartTokenizer.from_pretrained(args.bart_path)
 
         elif args.lat_bart_path is not None:
@@ -135,17 +127,12 @@ def get_model_and_tokenizer(args: Namespace, logger: Logger, to_device):
                 logger.error("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
             raise ValueError("One of `--default_config`, `--bart_path` and `--lat_bart_path` should be set")
 
-        # Load pretrained phoneme embedding
-        if args.phone_embed != "none" and os.path.exists(args.phone_embed_path):
-            phone_embed = load_phone_embed(config=model.config, args=args, logger=logger)
-            model.get_encoder().phone_embed.weight.data = phone_embed.to(model.device)
-
         # DDP will guarantee that parameters on different devices are the same! So please feel free to init it
         if args.init_model:
             if logger:
                 logger.info("[!] Initialize model parameters.")
             model_init(model, std=model.config.init_std, logger=logger,
-                       except_modules=(model.get_encoder().embed_tokens, model.get_encoder().phone_embed))
+                       except_modules=(model.get_encoder().embed_tokens,))
 
         if getattr(args, "lat_encoder", None) is not None and getattr(args, "lat_encoder", None).strip() != "":
             best_ckpt = select_best_checkpoint(args.lat_encoder, use_metric="loss", logger=logger)
@@ -221,55 +208,14 @@ def evaluate(model: Union[LatticeBart, DP], tokenizer: BartTokenizer, dataloader
     return {"bleu": bleu, "wer": wer, "cer": cer}
 
 
-def model_forward(model: Union[LatticeBart, DP, DDP], inputs: dict, eos_id: int, args: Namespace) -> dict:
-    if args.contrast_method == "dropout":
-        eos_pos = torch.where(inputs["input_ids"].eq(eos_id))
-
-        # Forward twice
-        if isinstance(model, (DP, DDP)):
-            enc_param = signature(model.module.get_encoder().forward).parameters
-            enc_inputs = {k: v for k, v in inputs.items() if k in enc_param}
-
-            last_state1 = model.module.get_encoder().forward(**enc_inputs, output_hidden_states=True)
-            last_state1 = last_state1.last_hidden_state[eos_pos]
-
-            outputs = model.forward(**inputs, reduction="none")
-            nll_loss = outputs["loss"].mean()
-        else:
-            enc_param = signature(model.get_encoder().forward).parameters
-            enc_inputs = {k: v for k, v in inputs.items() if k in enc_param}
-
-            last_state1 = model.get_encoder().forward(**enc_inputs, output_hidden_states=True)
-            last_state1 = last_state1.last_hidden_state[eos_pos]
-
-            outputs = model.forward(**inputs)
-            nll_loss = outputs["loss"]
-
-        last_state2 = outputs.encoder_last_hidden_state[eos_pos]
-        sim_mtx = cos_similarity_mtx(last_state1, last_state2)  # [B, B]
-        contrast_loss = contrastive_loss(sim_mtx, reduction="mean")
-
-        return {"loss": contrast_loss + nll_loss, "contrast": contrast_loss, "nll": nll_loss}
-
+def model_forward(model: Union[LatticeBart, DP, DDP], inputs: dict) -> dict:
+    if isinstance(model, (DP, DDP)):
+        outputs = model.forward(**inputs, reduction="none")
+        nll_loss = outputs["loss"].mean()
     else:
-        # Forward once
-        if isinstance(model, (DP, DDP)):
-            outputs = model.forward(**inputs, reduction="none")
-            nll_loss = outputs["loss"].mean()
-        else:
-            outputs = model.forward(**inputs)
-            nll_loss = outputs["loss"]
-
-        if args.contrast_method == "mask":
-            eos_position = torch.where(inputs["input_ids"].eq(eos_id))
-            enc_last_hidden = outputs["encoder_last_hidden_state"][eos_position]
-            last_state1 = enc_last_hidden[::2]
-            last_state2 = enc_last_hidden[1::2]
-            sim_mtx = cos_similarity_mtx(last_state1, last_state2)  # [B, B]
-            contrast_loss = contrastive_loss(sim_mtx, reduction="mean")
-            return {"loss": contrast_loss + nll_loss, "contrast": contrast_loss, "nll": nll_loss}
-        else:
-            return {"loss": nll_loss, "nll": nll_loss}
+        outputs = model.forward(**inputs)
+        nll_loss = outputs["loss"]
+    return {"loss": nll_loss}
 
 
 def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train_loader: DataLoader,
@@ -298,7 +244,7 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
 
         for step, inputs in enumerate(train_loader, start=1):
             inputs = dict_to_device(inputs, device)
-            losses = model_forward(model, inputs, tokenizer.eos_token_id, args)
+            losses = model_forward(model, inputs)
 
             loss = losses["loss"]
             loss.backward()
@@ -333,7 +279,7 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
 
             metric = metrics[args.use_metric]
 
-            if mtc.metric_is_better_than_ever(metric):
+            if mtc.metric_is_better_than_ever(metric) or args.always_save:
                 save_checkpoint(epoch=epoch, model=_model, metric=metric, optimizer=optimizer,
                                 tokenizer=tokenizer, runtime_metric=mtc, args=args, logger=logger)
 
@@ -383,9 +329,8 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
         batch_size = args.train_batch
         num_workers = args.num_workers
 
-    train_collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1),
-                                 phone_embed=args.phone_embed).collate_fn
-    dev_collate_fn = CollateFn(tokenizer=tokenizer, n_lat=1, phone_embed=args.phone_embed).collate_fn
+    train_collate_fn = CollateFn(tokenizer=tokenizer, decoder_input=args.decoder_input).collate_fn
+    dev_collate_fn = CollateFn(tokenizer=tokenizer, decoder_input=args.decoder_input).collate_fn
 
     train_loader = DataLoader(
         trainset, batch_size=batch_size, num_workers=num_workers, shuffle=False if _use_DDP else True,
@@ -398,7 +343,7 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
     optimizer = config_optimizer(model, args)
     total_steps = ceil(args.epoch * len(trainset) / (args.train_batch * args.grad_acc_steps))
     if logger:
-        logger.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.05)}")
+        logger.info(f"Total step: {total_steps}, warm-up steps: {floor(total_steps * 0.01)}")
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=floor(total_steps * 0.01),
@@ -474,7 +419,7 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
         # Testing
         logger.info("======== Start testing ========")
 
-        test_collate_fn = CollateFn(tokenizer, n_lat=1, return_keys=True, phone_embed=args.phone_embed).collate_fn
+        test_collate_fn = CollateFn(tokenizer, decoder_input="sent", return_keys=True).collate_fn
 
         for i, testset in enumerate(testsets):
             test_loader = DataLoader(
@@ -500,8 +445,6 @@ def main(_args: List[str] = None):
 
     logger = get_logger(args, "LatticeBartMain")
     show_args(args, logger)
-
-    # writer = SummaryWriter(log_dir=join(args.exp_dir, f"tensorboard_{time.strftime('%Y-%m-%d_%H-%M')}"))
 
     trainset, devset, testsets = prepare_datasets(args, logger)
     train_phase = test_phase = True

@@ -70,7 +70,6 @@ def BLEU(refer: List[List[str]], hypo: List[List[str]]) -> float:
     :return:    The corpus-level BLEU score.
     """
     assert len(refer) == len(hypo)
-    # TODO: BLEU应该用什么smoothing函数？
     refer_list = [[s] for s in refer]
     bleu = corpus_bleu(refer_list, hypo)
     return bleu
