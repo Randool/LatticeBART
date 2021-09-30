@@ -13,8 +13,8 @@ from torch import Tensor
 from torch.utils.data.dataset import Dataset
 from transformers import BartTokenizer, BatchEncoding
 
-from dataset.symbols import MASK
 from dataset.parse import parse_lattice_file, line_graph_process, parse_lattice_from_address, LAT_INFO
+from dataset.symbols import MASK
 from utils.phone import HomophoneReplacer
 
 MAX_NODEs = int(1e3)
@@ -264,18 +264,26 @@ class CollateFn:
 
     @staticmethod
     def padding_seqs(seqs: list, pad, max_len, tensor_type):
+        # Padding and truncating
         for i, seq in enumerate(seqs):
-            seqs[i] = max_len * [pad] if (seq is None) else seq + (max_len - len(seq)) * [pad]
+            if seq is None:
+                seqs[i] = max_len * [pad]
+            else:
+                if len(seq) <= max_len:
+                    seqs[i] = seq + (max_len - len(seq)) * [pad]
+                else:
+                    seqs[i] = seq[:max_len]
         return torch.tensor(seqs, dtype=tensor_type)
 
     @staticmethod
     def padding_mats(mats: list, pad, shape, tensor_type):
+        # Padding and truncating
         _mats = torch.zeros(len(mats), *shape, dtype=tensor_type).fill_(pad)
         for i, mat in enumerate(mats):
             if mat is None:
                 continue
             m, n = mat.shape
-            _mats[i, :m, :n] = mat
+            _mats[i, :min(m, shape[0]), :min(n, shape[1])] = mat[:min(m, shape[0]), :min(n, shape[1])]
         return _mats
 
     def collate_fn(self, batch_data: list) -> dict:
@@ -436,8 +444,8 @@ class CollateFn:
                 input_ids, marginal, min_depth, max_depth, fb, mask = lat_enc_info
                 depth_disturb = random.randint(0, process_cfg.depth_disturb)
                 batch_input_ids.append(input_ids)
-                batch_min_depth.append(min_depth + depth_disturb if (min_depth is not None) else None)
-                batch_max_depth.append(max_depth + depth_disturb if (max_depth is not None) else None)
+                batch_min_depth.append([d + depth_disturb for d in min_depth] if (min_depth is not None) else None)
+                batch_max_depth.append([d + depth_disturb for d in max_depth] if (max_depth is not None) else None)
                 batch_lat_mask.append(mask)
                 batch_fb.append(fb)
                 batch_marginal.append(marginal)
@@ -453,7 +461,7 @@ class CollateFn:
                 batch_dec_lat_mask.append(mask)
 
         # Group
-        max_len = max(map(len, batch_input_ids))
+        max_len = min(process_cfg.max_nodes, max(map(len, batch_input_ids)))
         mat_shape = (max_len, max_len)
 
         dec_max_len = max(map(len, batch_dec_input_ids))
@@ -472,8 +480,8 @@ class CollateFn:
 
             "decoder_input_ids": dec_inputs[:, :-1].contiguous(),
             "decoder_attention_mask": dec_mask[:, :-1, :-1].contiguous(),
-            "decoder_min_depth": self.padding_seqs(batch_dec_min_depth, MAX_NODEs, dec_max_len, torch.long),
-            "decoder_max_depth": self.padding_seqs(batch_dec_max_depth, MAX_NODEs, dec_max_len, torch.long),
+            "decoder_min_depth": self.padding_seqs(batch_dec_min_depth, MAX_NODEs, dec_max_len, torch.long)[:, :-1],
+            "decoder_max_depth": self.padding_seqs(batch_dec_max_depth, MAX_NODEs, dec_max_len, torch.long)[:, :-1],
             "labels": dec_inputs[:, 1:].contiguous(),
         }
         if self.return_keys:

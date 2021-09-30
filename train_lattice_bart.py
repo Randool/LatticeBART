@@ -208,6 +208,25 @@ def evaluate(model: Union[LatticeBart, DP], tokenizer: BartTokenizer, dataloader
     return {"bleu": bleu, "wer": wer, "cer": cer}
 
 
+def evaluate_fast(model: Union[LatticeBart, DP], dataloader: DataLoader, logger: Logger) -> dict:
+    _state = model.training
+    model.eval()
+    device = model.device if isinstance(model, LatticeBart) else model.module.device
+    loss_sum = 0
+    with torch.no_grad():
+        for inputs in dataloader:  # type: dict
+            inputs = dict_to_device(inputs, device)
+            outputs = model.forward(**inputs)
+            loss = outputs["loss"]
+            loss_sum += loss.item()
+    avg_loss = loss_sum / len(dataloader)
+    if logger:
+        logger.info(f"Eval | loss: {avg_loss:.3f}")
+    else:
+        print(f"Eval | loss: {avg_loss:.3f}")
+    return {"loss": avg_loss}
+
+
 def model_forward(model: Union[LatticeBart, DP, DDP], inputs: dict) -> dict:
     if isinstance(model, (DP, DDP)):
         outputs = model.forward(**inputs, reduction="none")
@@ -273,11 +292,15 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
         if mtc:
             _model = model.module if (is_DP or is_DDP) else model
 
-            metrics = evaluate(_model, tokenizer, dev_loader, args=args, logger=logger)
+            if args.decoder_input == "lattice":
+                metrics = evaluate_fast(_model, dev_loader, logger)
+                metric = metrics["loss"]
+            else:
+                metrics = evaluate(_model, tokenizer, dev_loader, args=args, logger=logger)
+                metric = metrics["bleu"]
+
             if writer is not None:
                 writer.add_scalars(main_tag="Metric", tag_scalar_dict=metrics, global_step=len(train_loader) * epoch)
-
-            metric = metrics[args.use_metric]
 
             if mtc.metric_is_better_than_ever(metric) or args.always_save:
                 save_checkpoint(epoch=epoch, model=_model, metric=metric, optimizer=optimizer,
@@ -425,7 +448,10 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
             test_loader = DataLoader(
                 testset, batch_size=args.eval_batch, num_workers=args.num_workers, collate_fn=test_collate_fn
             )
-            evaluate(model, tokenizer, dataloader=test_loader, args=args, logger=logger, save_to=f"hypo_{i}.txt")
+            if args.decoder_input == "lattice":
+                evaluate_fast(model, test_loader, logger)
+            else:
+                evaluate(model, tokenizer, dataloader=test_loader, args=args, logger=logger, save_to=f"hypo_{i}.txt")
 
     except FileNotFoundError:
         logger.error("FileNotFoundError!")

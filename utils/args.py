@@ -84,7 +84,7 @@ def add_args_for_train_procedure(parser: ArgumentParser):
     p.add_argument("--train_batch", type=int, default=8)
     p.add_argument("--eval_batch", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=0)
-    p.add_argument("--eval_every_step", type=int, default=500)
+    # p.add_argument("--eval_every_step", type=int, default=500)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--patience", type=int, default=5, help="Early stop")
     p.add_argument("--use_metric", type=str, choices=["bleu", "wer", "cer", "loss"], default="bleu")
@@ -102,7 +102,7 @@ def add_args_for_contrastive_learning(parser: ArgumentParser):
 
 def add_args_for_seq2seq_train(parser: ArgumentParser):
     p = parser.add_argument_group("Seq2Seq training args")
-    p.add_argument("--decoder_input", type=str, choices=("sent", "lattice"), default="sent")
+    p.add_argument("--decoder_input", type=str, required=True, choices=("sent", "lattice"), default="sent")
     p.add_argument("--always_save", type=int, choices=(0, 1), default=0)
 
 
@@ -120,7 +120,7 @@ name_abbr = {
     "init_model": "init", "lat_enc_layers": "nlayer", "lr": "lr", "optim": "optim",
     "parallel": "pall", "seed": "seed", "train_batch": "batch", "contrast_method": "contrast", "pooling_method": "pool",
     "use_marginal": "m", "use_min_depth": "mD", "use_max_depth": "MD", "use_forward_backward": "fb",
-    "use_lattice_mask": "MSK", "homophone_replace": "homo"
+    "use_lattice_mask": "MSK", "homophone_replace": "homo", "token_mask": "Tmask", "depth_disturb": "Dd",
 }
 
 
@@ -154,6 +154,11 @@ def config_exp_dir(args: Namespace):
     if getattr(args, "init_model"):
         parts.append("init")
 
+    if getattr(args, "decoder_input") == "sent":
+        parts.append("D-S")
+    else:
+        parts.append("D-L")
+
     for name in ("lat_enc_layers", "lr", "optim", "parallel", "seed",
                  "train_batch", "contrast_method", "pooling_method"):
         val = getattr(args, name, None)
@@ -169,7 +174,7 @@ def config_exp_dir(args: Namespace):
     # Data processing configs with particularity
     names = (
         "use_marginal", "use_min_depth", "use_max_depth", "use_forward_backward",
-        "use_lattice_mask", "homophone_replace"
+        "use_lattice_mask", "homophone_replace", "token_mask", "depth_disturb"
     )
     for name in names:
         val = getattr(args, name, None)
