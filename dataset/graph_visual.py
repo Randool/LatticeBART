@@ -23,8 +23,8 @@ def display_lattice(G: nx.DiGraph):
 
     edge_labels = {}
     for edge in G.edges:
-        info = G[edge[0]][edge[1]]
-        info = {k: f"{v:.1e}" for k, v in info.items()}
+        info = G[edge]
+        # info = {k: f"{v:.1e}"for k, v in info.items()}
         edge_labels[edge] = info
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=10, rotate=False)
 

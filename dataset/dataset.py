@@ -198,7 +198,7 @@ DataProcessCfg = namedtuple("DataProcessCfg", (
     "depth_disturb"
 ))
 
-_default_cfg = DataProcessCfg(1, 200, True, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, 0, 0)
+_default_cfg = DataProcessCfg(1, 256, True, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0, 0, 0)
 
 
 class LatticeTextDataset(Dataset):

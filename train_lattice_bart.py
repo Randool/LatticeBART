@@ -114,13 +114,16 @@ def get_model_and_tokenizer(args: Namespace, logger: Logger, to_device):
             model = LatticeBart(config)
             tokenizer = get_tokenizer()
 
+        elif (args.lat_bart_path is not None) and exists(args.lat_bart_path):
+            if logger:
+                logger.info(f"Load pretrained model from {args.lat_bart_path}")
+            best_ckpt = select_best_checkpoint(args.lat_bart_path, use_metric="loss", logger=logger)
+            model = LatticeBart.from_pretrained(best_ckpt)
+            tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
+
         elif args.bart_path is not None:
             model = LatticeBart.from_bart(bart_path=args.bart_path, lat_enc_layers=args.lat_enc_layers)
             tokenizer = BartTokenizer.from_pretrained(args.bart_path)
-
-        elif args.lat_bart_path is not None:
-            model = LatticeBart.from_pretrained(args.lat_bart_path)
-            tokenizer = BartTokenizer.from_pretrained(args.lat_bart_path)
 
         else:
             if logger:
@@ -215,6 +218,8 @@ def evaluate_fast(model: Union[LatticeBart, DP], dataloader: DataLoader, logger:
     loss_sum = 0
     with torch.no_grad():
         for inputs in dataloader:  # type: dict
+            if "key" in inputs:
+                inputs.pop("key")
             inputs = dict_to_device(inputs, device)
             outputs = model.forward(**inputs)
             loss = outputs["loss"]
@@ -294,10 +299,10 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
 
             if args.decoder_input == "lattice":
                 metrics = evaluate_fast(_model, dev_loader, logger)
-                metric = metrics["loss"]
             else:
                 metrics = evaluate(_model, tokenizer, dev_loader, args=args, logger=logger)
-                metric = metrics["bleu"]
+
+            metric = metrics[args.use_metric]
 
             if writer is not None:
                 writer.add_scalars(main_tag="Metric", tag_scalar_dict=metrics, global_step=len(train_loader) * epoch)
