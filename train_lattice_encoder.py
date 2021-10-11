@@ -112,7 +112,10 @@ def select_best_checkpoint(exp_dir: str, use_metric: str, logger: Logger = None)
     for m in metrics:
         *prefix, metric = m.split("/")
         prefix = "/".join(prefix)
-        metric = float(metric.split("_")[-1])
+        if metric[-1] == "%":  # wer cer
+            metric = float(metric.split("_")[-1][:-1])
+        else:
+            metric = float(metric.split("_")[-1])
         n = int(re.match(r".*epoch_(?P<n>\d+).*", prefix).group("n"))
 
         if best_metric is None:
@@ -454,7 +457,8 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
         batch_size = args.train_batch
         num_workers = args.num_workers
 
-    collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1)).collate_fn
+    collate_fn = CollateFn(tokenizer=tokenizer, process_cfg=trainset.process_cfg, decoder_input=args.decoder_input,
+                           n_lat=(2 if args.contrast_method == "mask" else 1)).collate_fn
 
     train_loader = DataLoader(
         trainset, batch_size=batch_size, shuffle=False if _use_DDP else True, num_workers=num_workers,
@@ -542,9 +546,10 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
         if logger:
             logger.info("======== Start testing ========")
 
-        collate_fn = CollateFn(tokenizer=tokenizer, n_lat=(2 if args.contrast_method == "mask" else 1)).collate_fn
-
         for i, testset in enumerate(testsets):
+            collate_fn = CollateFn(tokenizer=tokenizer, process_cfg=testset.process_cfg,
+                                   decoder_input=args.decoder_input,
+                                   n_lat=(2 if args.contrast_method == "mask" else 1)).collate_fn
             test_loader = DataLoader(testset, batch_size=args.eval_batch, shuffle=False,
                                      num_workers=args.num_workers, collate_fn=collate_fn)
             evaluate(encoder=encoder, tokenizer=tokenizer, dataloader=test_loader, args=args, logger=logger)

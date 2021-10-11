@@ -87,7 +87,8 @@ def add_args_for_train_procedure(parser: ArgumentParser):
     # p.add_argument("--eval_every_step", type=int, default=500)
     p.add_argument("--log_every", type=int, default=50)
     p.add_argument("--patience", type=int, default=5, help="Early stop")
-    p.add_argument("--use_metric", type=str, choices=["bleu", "wer", "cer", "loss"], default="bleu")
+    p.add_argument("--pass_eval", type=int, choices=(0, 1), default=0, help="Pass evaluation phase")
+    p.add_argument("--use_metric", type=str, choices=["bleu", "wer", "cer", "loss", "ppl"], default="bleu")
 
 
 CHOICE = ("dropout", "mask",)

@@ -31,7 +31,7 @@ def show_args(args: Namespace, logger: Logger):
 def set_logger(args: Namespace):
     os.makedirs(args.exp_dir, exist_ok=True)
     logging.basicConfig(filename=join(args.exp_dir, "log.txt"), level=logging.INFO,
-                        datefmt='%H:%M:%S', format='[%(asctime)s] %(levelname)s - %(message)s')
+                        datefmt='%m-%d %H:%M:%S', format='[%(asctime)s] %(levelname)s - %(message)s')
 
 
 def get_logger(args: Namespace, logger_name: str):
@@ -47,7 +47,7 @@ def get_logger(args: Namespace, logger_name: str):
     # Repeated calls to `addHandler` result in repeated log output
     if len(logger.handlers) == 0:
         # print(f"Add handler to {logger_name}")
-        formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%H:%M:%S')
+        formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%m-%d %H:%M:%S')
         handler = logging.FileHandler(join(args.exp_dir, "log.txt"), encoding="utf8")
         handler.setFormatter(formatter)
         logger.addHandler(handler)

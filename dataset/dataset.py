@@ -183,13 +183,29 @@ class _OracleDataset(__TextDataset):
         super().__init__(text_file_pattern, lower_case=lower_case, token_split=True)
 
 
-class TextDataset(__TextDataset):
+class _TextDataset(__TextDataset):
     def __init__(self, text_file_pattern: str, lower_case=True, norm=False):
         super().__init__(text_file_pattern, lower_case=lower_case, token_split=False)
         if norm:
             for key, val in self.items.keys():
                 # TODO: 实现text正则化功能
                 self.items[key] = val
+
+
+class TextDataset(__TextDataset, Dataset):
+    def __init__(self, text_file_pattern: str, lower_case=True, norm=False):
+        super().__init__(text_file_pattern, lower_case=lower_case, token_split=False)
+        if norm:
+            for key, val in self.items.keys():
+                # TODO: 实现text正则化功能
+                self.items[key] = val
+        self.sents = [v for k, v in self.items.items()]
+
+    def __len__(self):
+        return len(self.sents)
+
+    def __getitem__(self, idx):
+        return self.sents[idx]
 
 
 DataProcessCfg = namedtuple("DataProcessCfg", (
@@ -223,7 +239,7 @@ class LatticeTextDataset(Dataset):
         if text_pattern is None:
             self.items = [[key, lattices[key], None] for key in lattices.keys()]
         else:
-            transcripts = TextDataset(text_pattern, lower_case=self.process_cfg.lower_case)
+            transcripts = _TextDataset(text_pattern, lower_case=self.process_cfg.lower_case)
             common_keys = set(lattices.keys()) & set(transcripts.keys())
             self.items = [[key, lattices[key], transcripts[key]] for key in lattices.keys() if key in common_keys]
 
@@ -251,8 +267,8 @@ class LatticeTextDataset(Dataset):
 
 
 class CollateFn:
-    def __init__(self, tokenizer: BartTokenizer, decoder_input, n_lat=1, return_keys=False,
-                 process_cfg: DataProcessCfg = _default_cfg):
+    def __init__(self, tokenizer: BartTokenizer, decoder_input, process_cfg: DataProcessCfg, n_lat=1,
+                 return_keys=False):
         assert decoder_input in ("sent", "lattice"), f"Unsupported value: {decoder_input}"
         self.tokenizer = tokenizer
         self.n_lat = n_lat

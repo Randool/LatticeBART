@@ -59,8 +59,12 @@ def prepare_datasets(args: Namespace, logger: Logger):
     )
     process_cfg_for_test = DataProcessCfg(
         min_nodes=args.min_nodes, max_nodes=args.max_nodes, lower_case=True, ac_scale=args.ac_scale,
-        lm_scale=args.lm_scale, use_marginal=1, use_min_depth=1, use_max_depth=1, use_forward_backward=1,
-        use_lattice_mask=1, homophone_replace=0, token_mask=0, depth_disturb=0,
+        lm_scale=args.lm_scale, use_marginal=1 if args.use_marginal else 0,
+        use_min_depth=1 if args.use_min_depth else 0,
+        use_max_depth=1 if args.use_max_depth else 0,
+        use_forward_backward=1 if args.use_forward_backward else 0,
+        use_lattice_mask=1 if args.use_lattice_mask else 0,
+        homophone_replace=0, token_mask=0, depth_disturb=0,
     )
 
     trainset, devset, testsets = None, None, []
@@ -196,9 +200,9 @@ def evaluate(model: Union[LatticeBart, DP], tokenizer: BartTokenizer, dataloader
                 for hypo in word_hypos:
                     f.write(f"{' '.join(hypo)}\n")
 
-    char_refers = [list(s) for s in refers]
-    char_hypos = [list(s) for s in hypos]
-    cer = WER(char_refers, char_hypos, is_wer=False, logger=logger)
+    # char_refers = [list(s) for s in refers]
+    # char_hypos = [list(s) for s in hypos]
+    # cer = WER(char_refers, char_hypos, is_wer=False, logger=logger)
 
     if _state:
         model.train()
@@ -208,7 +212,7 @@ def evaluate(model: Union[LatticeBart, DP], tokenizer: BartTokenizer, dataloader
     else:
         print(f"Eval | BLEU: {bleu:.3f}")
 
-    return {"bleu": bleu, "wer": wer, "cer": cer}
+    return {"bleu": bleu, "wer": wer}
 
 
 def evaluate_fast(model: Union[LatticeBart, DP], dataloader: DataLoader, logger: Logger) -> dict:
@@ -297,15 +301,18 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
         if mtc:
             _model = model.module if (is_DP or is_DDP) else model
 
-            if args.decoder_input == "lattice":
-                metrics = evaluate_fast(_model, dev_loader, logger)
+            if args.pass_eval:
+                metric = 0
             else:
-                metrics = evaluate(_model, tokenizer, dev_loader, args=args, logger=logger)
+                if args.decoder_input == "lattice":
+                    metrics = evaluate_fast(_model, dev_loader, logger)
+                else:
+                    metrics = evaluate(_model, tokenizer, dev_loader, args=args, logger=logger)
+                metric = metrics[args.use_metric]
 
-            metric = metrics[args.use_metric]
-
-            if writer is not None:
-                writer.add_scalars(main_tag="Metric", tag_scalar_dict=metrics, global_step=len(train_loader) * epoch)
+                if writer is not None:
+                    writer.add_scalars(main_tag="Metric", tag_scalar_dict=metrics,
+                                       global_step=len(train_loader) * epoch)
 
             if mtc.metric_is_better_than_ever(metric) or args.always_save:
                 save_checkpoint(epoch=epoch, model=_model, metric=metric, optimizer=optimizer,
@@ -357,8 +364,10 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
         batch_size = args.train_batch
         num_workers = args.num_workers
 
-    train_collate_fn = CollateFn(tokenizer=tokenizer, decoder_input=args.decoder_input).collate_fn
-    dev_collate_fn = CollateFn(tokenizer=tokenizer, decoder_input=args.decoder_input).collate_fn
+    train_collate_fn = CollateFn(tokenizer=tokenizer, decoder_input=args.decoder_input,
+                                 process_cfg=trainset.process_cfg).collate_fn
+    dev_collate_fn = CollateFn(tokenizer=tokenizer, decoder_input=args.decoder_input,
+                               process_cfg=devset.process_cfg).collate_fn
 
     train_loader = DataLoader(
         trainset, batch_size=batch_size, num_workers=num_workers, shuffle=False if _use_DDP else True,
@@ -447,9 +456,9 @@ def test(testsets: List[LatticeTextDataset], args: Namespace, logger: Logger):
         # Testing
         logger.info("======== Start testing ========")
 
-        test_collate_fn = CollateFn(tokenizer, decoder_input="sent", return_keys=True).collate_fn
-
         for i, testset in enumerate(testsets):
+            test_collate_fn = CollateFn(tokenizer, decoder_input="sent", process_cfg=testset.process_cfg,
+                                        return_keys=True).collate_fn
             test_loader = DataLoader(
                 testset, batch_size=args.eval_batch, num_workers=args.num_workers, collate_fn=test_collate_fn
             )
