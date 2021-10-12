@@ -62,7 +62,7 @@ class LatticeSelfAttention(nn.Module):
         assert lattice_mask.shape == forward_backward.shape == (bsz, 1, tgt_len, src_len), \
             f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {lattice_mask.size()}"
 
-        attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + forward_backward + lattice_mask
+        attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + forward_backward * self.scaling + lattice_mask
         attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         attn_weights = F.softmax(attn_weights, dim=-1)

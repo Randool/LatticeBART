@@ -2,12 +2,13 @@ import json
 from typing import Union
 
 import networkx as nx
+import numpy as np
 
 
 def dump_graph(G: nx.DiGraph, filename: str = None) -> dict:
     graph = {
         "nodes": [(n, G.nodes[n]) for n in G.nodes],
-        "edges": [(u, v, G[u][v]) for u, v in G.edges]
+        "edges": [(e, G.edges[e]) for e in G.edges]
     }
     if filename is not None:
         with open(filename, "w", encoding="utf8") as f:
@@ -26,3 +27,8 @@ def load_graph(graph: Union[dict, str]) -> nx.DiGraph:
     G.add_nodes_from(graph['nodes'])
     G.add_edges_from(graph['edges'])
     return G
+
+
+def log_sum_exp(logp: np.ndarray):
+    logp = logp - max(logp)
+    return np.log(np.sum(np.exp(logp)))
