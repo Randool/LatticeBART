@@ -24,7 +24,7 @@ from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, 
 from models.config import get_model_config, get_tokenizer
 from models.encoder import EncoderWrapper
 from models.lattice_bart import LatticeBart
-from models.model_utils import config_layer_wise_lr, model_init
+from models.model_utils import config_layer_wise_lr, model_init, wrap_distributed_parallel
 from utils.args import *
 from utils.metric import cos_similarity_mtx, contrastive_loss, show_similarity_mtx
 from utils.optimizer import Lamb, Lookahead
@@ -175,19 +175,6 @@ def get_encoder_and_tokenizer(args: Namespace, logger: Logger, to_device):
 
     encoder.to(to_device)
     return encoder, tokenizer
-
-
-def wrap_distributed_parallel(rank, model: Union[EncoderWrapper, LatticeBart], args: Namespace, logger: Logger):
-    if args.parallel == "DP" and args.ngpus > 1:
-        if logger:
-            logger.info(f"Found {args.ngpus} GPUs, using DataParallel")
-        model = DP(model.to(args.device))
-    elif args.parallel == "DDP" and args.ngpus > 1:
-        if logger:
-            logger.info(f"Rank: {rank}. Found {args.ngpus} GPUs, using DistributedDataParallel")
-        torch.cuda.set_device(f"cuda:{rank}")
-        model = DDP(model.to(f"cuda:{rank}"), device_ids=[rank], output_device=0)
-    return model
 
 
 def config_optimizer(encoder: Union[EncoderWrapper, LatticeBart], args: Namespace):

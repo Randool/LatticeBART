@@ -1,17 +1,22 @@
+from argparse import Namespace
 from collections import defaultdict
 from logging import Logger
 from typing import Dict, Union
 
+import torch
 import torch.nn as nn
+from torch.nn import DataParallel as DP
+from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers.models.bart.modeling_bart import BartEncoderLayer, BartDecoderLayer
 
 from utils.utils import log
-from .encoder import LatticeEncoderLayer
+from .encoder import LatticeEncoderLayer, EncoderWrapper
+from .lattice_bart import LatticeBart
 
 _stop_layers = (LatticeEncoderLayer, BartEncoderLayer, BartDecoderLayer)
 
 
-def layer_wise_traverse(model: nn.Module, stop_layers=_stop_layers):
+def _layer_wise_traverse(model: nn.Module, stop_layers=_stop_layers):
     """ Travel across layers, from encoder to decoder. Recursion is stop when meeting layers exist in `stop_layers` """
     layers = []
 
@@ -19,7 +24,7 @@ def layer_wise_traverse(model: nn.Module, stop_layers=_stop_layers):
         if isinstance(child, stop_layers):
             layers.append(child)
             continue
-        layers += layer_wise_traverse(child, stop_layers)
+        layers += _layer_wise_traverse(child, stop_layers)
 
     if len(layers) == 0:
         layers.append(model)
@@ -30,7 +35,7 @@ def layer_wise_traverse(model: nn.Module, stop_layers=_stop_layers):
 def config_layer_wise_lr(model: nn.Module, init_lr: float, lr_decay: float, stop_layers=_stop_layers,
                          logger: Logger = None) -> list:
     """ Specify per-layer learning rates """
-    layers = layer_wise_traverse(model, stop_layers)
+    layers = _layer_wise_traverse(model, stop_layers)
 
     # The parameters can be shared between layers, and we assign the maximum depth to parameters
     param_id_to_depth = {}  # type: Dict[int, int]
@@ -65,6 +70,7 @@ def config_layer_wise_lr(model: nn.Module, init_lr: float, lr_decay: float, stop
 
 
 def model_init(model: nn.Module, std: float, except_modules: Union[list, tuple] = (), logger: Logger = None):
+    """ Initialize model parameters """
     # Init function
     def _init_weights(m):
         if m in except_modules:
@@ -81,3 +87,17 @@ def model_init(model: nn.Module, std: float, except_modules: Union[list, tuple] 
                 m.weight.data[m.padding_idx].zero_()
 
     model.apply(_init_weights)
+
+
+def wrap_distributed_parallel(rank, model: Union[EncoderWrapper, LatticeBart], args: Namespace, logger: Logger):
+    """ Wrap the model with data parallel or distributed data parallel """
+    if args.parallel == "DP" and args.ngpus > 1:
+        if logger:
+            logger.info(f"Found {args.ngpus} GPUs, using DataParallel")
+        model = DP(model.to(args.device))
+    elif args.parallel == "DDP" and args.ngpus > 1:
+        if logger:
+            logger.info(f"Rank: {rank}. Found {args.ngpus} GPUs, using DistributedDataParallel")
+        torch.cuda.set_device(f"cuda:{rank}")
+        model = DDP(model.to(f"cuda:{rank}"), device_ids=[rank], output_device=0)
+    return model

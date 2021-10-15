@@ -20,7 +20,8 @@ from transformers import BartTokenizer, get_cosine_schedule_with_warmup
 
 from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, CollateFn
 from models import get_model_config, get_tokenizer, LatticeEncoder, LatticeBart, model_init
-from train_lattice_encoder import save_checkpoint, select_best_checkpoint, config_optimizer, wrap_distributed_parallel
+from models.model_utils import wrap_distributed_parallel
+from train_lattice_encoder import save_checkpoint, select_best_checkpoint, config_optimizer
 from utils.args import *
 from utils.metric import WER, BLEU
 from utils.utils import set_seed, RuntimeMetric, use_DP, use_DDP, setup_dist_environment, \
@@ -216,6 +217,7 @@ def evaluate(model: Union[LatticeBart, DP], tokenizer: BartTokenizer, dataloader
 
 
 def evaluate_fast(model: Union[LatticeBart, DP], dataloader: DataLoader, logger: Logger) -> dict:
+    """ Ignore the complex reasoning process and calculate the loss directly to improve the test speed """
     _state = model.training
     model.eval()
     device = model.device if isinstance(model, LatticeBart) else model.module.device

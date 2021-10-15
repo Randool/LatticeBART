@@ -344,7 +344,7 @@ class CollateFn:
                         assert lattice_id == key or key.startswith(lattice_id), \
                             f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
 
-                    assert isinstance(lat, nx.DiGraph), f"Suppose `nx.DigGraph` lat, got {type(lat)}"
+                    assert isinstance(lat, nx.MultiDiGraph), f"Suppose `nx.DigGraph` lat, got {type(lat)}"
 
                     # Replace homophone in nodes
                     if self.homophone_replacer is not None:
@@ -431,7 +431,7 @@ class CollateFn:
                     assert lattice_id == key or key.startswith(lattice_id), \
                         f"Lattice id mismatch: lattice_id ({lattice_id}, key ({key}))"
 
-                assert isinstance(lat, nx.DiGraph), f"Suppose `nx.DigGraph` lat, got {type(lat)}"
+                assert isinstance(lat, nx.MultiDiGraph), f"Suppose `nx.DigGraph` lat, got {type(lat)}"
 
                 # The lattices fed into encoder and decoder are different.
                 lat_enc, lat_dec = lat, deepcopy(lat)
