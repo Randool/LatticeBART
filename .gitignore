@@ -7,10 +7,10 @@ debug
 exp
 __pycache__/
 **/__pycache__/
-tools/
+#tools/
 
 # Files
-*.sh
+#*.sh
 .stignore
-debug*.py
-*.md
+#debug*.py
+#*.md
