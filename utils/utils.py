@@ -1,22 +1,20 @@
 import json
 import logging
 import os
-import random
 import sys
 from argparse import Namespace
 from logging import Logger
 from os.path import join
 from typing import List
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
 
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+def is_main_process():
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() in [0, -1]
 
 
 #### Logging ####
@@ -28,17 +26,19 @@ def show_args(args: Namespace, logger: Logger):
     logger.info("=" * 30)
 
 
-def set_logger(args: Namespace):
-    os.makedirs(args.exp_dir, exist_ok=True)
-    logging.basicConfig(filename=join(args.exp_dir, "log.txt"), level=logging.INFO,
-                        datefmt='%m-%d %H:%M:%S', format='[%(asctime)s] %(levelname)s - %(message)s')
+def set_logger(exp_dir: str = None):
+    if exp_dir is None:
+        logging.basicConfig(level=logging.INFO, datefmt="%m-%d %H:%M:%S",
+                            format="[%(asctime)s] %(levelname)s - %(message)s")
+    else:
+        os.makedirs(exp_dir, exist_ok=True)
+        logging.basicConfig(filename=join(exp_dir, "log.txt"), level=logging.INFO,
+                            datefmt='%m-%d %H:%M:%S', format='[%(asctime)s] %(levelname)s - %(message)s')
 
 
-def get_logger(args: Namespace, logger_name: str):
-    os.makedirs(args.exp_dir, exist_ok=True)
-
+def get_logger(logger_name: str, exp_dir: str = None):
     logger = logging.getLogger(logger_name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO if is_main_process() else logging.WARN)
 
     if len(logger.handlers) > 0:
         for handler in logger.handlers:
@@ -46,10 +46,14 @@ def get_logger(args: Namespace, logger_name: str):
 
     # Repeated calls to `addHandler` result in repeated log output
     if len(logger.handlers) == 0:
-        # print(f"Add handler to {logger_name}")
         formatter = logging.Formatter(fmt='[%(asctime)s] %(levelname)s - %(message)s', datefmt='%m-%d %H:%M:%S')
-        handler = logging.FileHandler(join(args.exp_dir, "log.txt"), encoding="utf8")
-        handler.setFormatter(formatter)
+        if exp_dir is None:
+            handler = logging.StreamHandler()
+            handler.setFormatter(formatter)
+        else:
+            os.makedirs(exp_dir, exist_ok=True)
+            handler = logging.FileHandler(join(exp_dir, "log.txt"), encoding="utf8")
+            handler.setFormatter(formatter)
         logger.addHandler(handler)
 
     return logger

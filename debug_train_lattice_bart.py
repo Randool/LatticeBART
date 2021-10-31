@@ -1,27 +1,22 @@
 import re
 import socket
-from train_lattice_bart import main
+
+from train_lattice_bart_huggingface import main
 
 config = {
     "bart_path": "/home/randool/Dataset/transformers/bart-base",
     "init_model": 0,
-    "seed": 2048,
-    "exp_dir": "debug/exp/lattice_bart",
+    "seed": 42,
 }
 
 if socket.gethostname() != "randool-manjaro":
     config["bart_path"] = "/mnt/xlancefs/home/lfd98/Dataset/transformers/bart-base"
 
+# --default_config base
+
 train_cmd = """
---lat_enc_layers 6
 --bart_path {bart_path}
 --init_model {init_model}
-
---lr 1e-5
---weight_decay 1e-6
---lr_decay 0.95
---grad_acc_steps 2
---clip 1e-1
 
 --train_lat_ark debug/data/swbd/train.ark
 --eval_lat_ark  debug/data/swbd/dev.ark
@@ -39,35 +34,49 @@ train_cmd = """
 --use_max_depth 1
 --use_forward_backward 1
 --use_lattice_mask 1
---homophone_replace 0.05
---token_mask 0.05
---depth_disturb 5
-
---device cuda:0
---parallel DDP
---seed {seed}
---optim adam
---exp_dir {exp_dir}
---epoch 7
---train_batch 2
---eval_batch 8
---num_workers 4
---log_every 10
---patience 3
---use_metric loss
-
+--homophone_replace 0.00
+--token_mask 0.00
+--depth_disturb 0
 --decoder_input lattice
---always_save 1
 
---num_beams 4
---min_len 2
---max_len 256
+--output_dir ./debug/exp
+--do_train   True
+--do_eval    True
+--do_predict True
+--evaluation_strategy epoch
+
+--per_device_train_batch_size 2
+--per_device_eval_batch_size  8
+--gradient_accumulation_steps 4
+
+--learning_rate 1e-5
+--weight_decay  1e-6
+--label_smoothing_factor 0.0
+--lr_scheduler_type cosine
+
+--num_train_epochs 8
+--warmup_ratio     0.01
+
+--disable_tqdm  True
+--logging_steps 20
+--save_strategy epoch
+--save_steps    500
+
+--dataloader_drop_last   True
+--dataloader_num_workers 3
+--dataloader_pin_memory  False
+
+--metric_for_best_model  loss
+--greater_is_better      False
+--load_best_model_at_end True
+
+--predict_with_generate True
+--generation_max_length 128
+--generation_num_beams  4
 """
 
 if __name__ == "__main__":
-    for seed in (66,):
-        config["seed"] = seed
-        cmd = train_cmd.format(**config)
-        # do_train
-        args = re.split("\\s+", cmd.strip())
-        main(args)
+    cmd = train_cmd.format(**config)
+    # do_train
+    args = re.split("\\s+", cmd.strip())
+    main(args)

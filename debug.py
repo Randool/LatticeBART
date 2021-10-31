@@ -391,7 +391,7 @@ def test_lattice_bart_generate(model_path=bart_tiny_path):
         outputs = model.generate(
             **inputs,
             num_beams=2,
-            # max_length=50,
+            max_length=10,
             do_sample=True,
             bad_words_ids=bad_words_ids
         )
@@ -486,4 +486,4 @@ def test_rescore_lm():
 
 
 if __name__ == '__main__':
-    pass
+    test_lattice_bart_generate(bart_base_path)

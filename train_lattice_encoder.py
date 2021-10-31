@@ -3,12 +3,11 @@ Train the encoder of LatticeBart in a contrastive-learning fashion
 """
 import argparse
 import glob
-import json
 import time
 from logging import Logger
 from math import ceil, floor
 from os.path import exists
-from typing import Union, List
+from typing import Union
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -18,7 +17,7 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from transformers import BartTokenizer, AdamW, get_cosine_schedule_with_warmup
+from transformers import BartTokenizer, AdamW, get_cosine_schedule_with_warmup, set_seed
 
 from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, CollateFn
 from models.config import get_model_config, get_tokenizer
@@ -28,7 +27,7 @@ from models.model_utils import config_layer_wise_lr, model_init, wrap_distribute
 from utils.args import *
 from utils.metric import cos_similarity_mtx, contrastive_loss, show_similarity_mtx
 from utils.optimizer import Lamb, Lookahead
-from utils.utils import RuntimeMetric, get_logger, show_args, use_DDP, get_free_port, setup_dist_environment, set_seed, \
+from utils.utils import RuntimeMetric, get_logger, show_args, use_DDP, get_free_port, setup_dist_environment, \
     use_DP, cleanup_dist_environment
 
 
@@ -428,7 +427,7 @@ def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDat
     set_seed(args.seed)
 
     if logger is None and rank == 0:
-        logger = get_logger(args, "LatticeEncoderTrain")
+        logger = get_logger("LatticeEncoderTrain", args.exp_dir)
     writer = SummaryWriter(log_dir=join(args.exp_dir, "tensorboard")) if rank <= 0 else None
 
     _use_DP, _use_DDP = use_DP(args), use_DDP(args)
@@ -562,7 +561,7 @@ def main(_args: List[str] = None):
     args = parse_args_and_setup_hyper_param(_args)
     os.makedirs(args.exp_dir, exist_ok=True)
 
-    logger = get_logger(args, "LatticeEncoderMain")
+    logger = get_logger("LatticeEncoderMain", args.exp_dir)
     show_args(args, logger)
 
     trainset, devset, debug_set, testsets = prepare_datasets(args, logger)
