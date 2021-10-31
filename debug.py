@@ -391,7 +391,7 @@ def test_lattice_bart_generate(model_path=bart_tiny_path):
         outputs = model.generate(
             **inputs,
             num_beams=2,
-            # max_length=50,
+            max_length=10,
             do_sample=True,
             bad_words_ids=bad_words_ids
         )
@@ -485,5 +485,33 @@ def test_rescore_lm():
     print(model.calculate_logprob(**inputs))
 
 
+def _test_all_gather(rank: int, word_size: int, port: int):
+    import torch.distributed as dist
+    from utils.utils import setup_dist_environment, cleanup_dist_environment
+
+    print(rank)
+    setup_dist_environment(rank, word_size, port)
+
+    tensor = torch.tensor(rank).to(f"cuda:{rank}")
+    output_tensors = [tensor.clone() for _ in range(dist.get_world_size())]
+    # output_tensors = [t if len(t.shape) > 0 else t[None] for t in output_tensors]
+    dist.all_gather(output_tensors, tensor)
+    # output_tensors = torch.cat(output_tensors, dim=0)
+    print(dist.get_rank(), tensor, output_tensors)
+
+    cleanup_dist_environment()
+
+
+def test_all_gather():
+    from utils.utils import get_free_port
+    import torch.multiprocessing as mp
+
+    world_size = torch.cuda.device_count()
+    port = get_free_port()
+    print(world_size)
+
+    mp.spawn(_test_all_gather, args=(world_size, port), nprocs=world_size)
+
+
 if __name__ == '__main__':
-    pass
+    test_all_gather()

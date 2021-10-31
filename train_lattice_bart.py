@@ -5,7 +5,7 @@ import argparse
 from logging import Logger
 from math import ceil, floor
 from os.path import exists
-from typing import Union, List
+from typing import Union
 
 import torch.cuda
 import torch.distributed as dist
@@ -16,7 +16,7 @@ from torch.nn import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from transformers import BartTokenizer, get_cosine_schedule_with_warmup
+from transformers import BartTokenizer, get_cosine_schedule_with_warmup, set_seed
 
 from dataset.dataset import LatticeTextDataset, dict_to_device, DataProcessCfg, CollateFn
 from models import get_model_config, get_tokenizer, LatticeEncoder, LatticeBart, model_init
@@ -24,7 +24,7 @@ from models.model_utils import wrap_distributed_parallel
 from train_lattice_encoder import save_checkpoint, select_best_checkpoint, config_optimizer
 from utils.args import *
 from utils.metric import WER, BLEU
-from utils.utils import set_seed, RuntimeMetric, use_DP, use_DDP, setup_dist_environment, \
+from utils.utils import RuntimeMetric, use_DP, use_DDP, setup_dist_environment, \
     cleanup_dist_environment, get_free_port, get_logger, show_args
 
 
@@ -336,7 +336,7 @@ def training(model: Union[LatticeBart, DP, DDP], tokenizer: BartTokenizer, train
 def train(rank: int, world_size: int, master_port: int, trainset: LatticeTextDataset, devset: LatticeTextDataset,
           args: Namespace, logger: Logger = None):
     if logger is None and rank == 0:
-        logger = get_logger(args, "LatticeBartTrain")
+        logger = get_logger("LatticeBartTrain", args.exp_dir)
 
     if trainset is None or len(trainset) == 0:
         if logger:
@@ -485,7 +485,7 @@ def main(_args: List[str] = None):
     args = parse_args_and_setup_hyper_param(_args)
     os.makedirs(args.exp_dir, exist_ok=True)
 
-    logger = get_logger(args, "LatticeBartMain")
+    logger = get_logger("LatticeBartMain", args.exp_dir)
     show_args(args, logger)
 
     trainset, devset, testsets = prepare_datasets(args, logger)

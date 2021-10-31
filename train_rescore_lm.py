@@ -59,7 +59,7 @@ def save_checkpoint(epoch: int, model, metric, vocab: Vocab, args: Namespace, lo
 
 def main(_args=None):
     args = parse_args(_args)
-    logger = get_logger(args, "LSTM")
+    logger = get_logger("LSTM", args.exp_dir)
     show_args(args, logger)
     vocab, trainset, devset = prepare_datasets(args, logger)
     collate_fn = vocab.collate_fn
