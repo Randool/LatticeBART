@@ -438,7 +438,7 @@ def test_homonym_replace():
     from dataset.dataset import TextDataset
     from utils.phone import HomophoneReplacer
 
-    text_dataset = TextDataset("debug/data/librispeech/text")
+    text_dataset = TextDataset("../debug/data/librispeech/text")
     hr = HomophoneReplacer()
 
     for key in text_dataset.keys():

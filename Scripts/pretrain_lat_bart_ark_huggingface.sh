@@ -10,6 +10,7 @@
 #SBATCH --array=0
 
 hostname
+export PYTHONPATH="${HOME}/Projects/LatticeBART"
 
 python \
   -m torch.distributed.launch --nproc_per_node=4 --nnodes=1 --node_rank="${SLURM_ARRAY_TASK_ID}" \

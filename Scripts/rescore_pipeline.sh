@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -e
+export PYTHONPATH="${HOME}/Projects/LatticeBART"
 
 eval2000=/mnt/lustre/sjtu/home/lfd98/Dataset/mr_fisher_swbd/decode_eval2000
 rt03=/mnt/lustre/sjtu/home/lfd98/Dataset/mr_fisher_swbd/decode_rt03
