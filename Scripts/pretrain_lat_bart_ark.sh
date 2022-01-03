@@ -10,6 +10,7 @@
 #SBATCH --array=5,6
 
 hostname
+export PYTHONPATH="${HOME}/Projects/LatticeBART"
 
 lat_bart_path=none
 exp_dir=exp/LatBart

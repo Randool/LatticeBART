@@ -9,6 +9,7 @@
 #SBATCH --exclude=gqxx-01-[011,016,020,033,083,093,105,110,116,125,139,145,146,152,167,174]
 #SBATCH --array=0
 
+export PYTHONPATH="${HOME}/Projects/LatticeBART"
 
 python train_rescore_lm.py \
   --train_text "${HOME}/Dataset/mr_fisher_swbd/train.txt" \
