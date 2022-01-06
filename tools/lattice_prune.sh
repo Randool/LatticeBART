@@ -56,7 +56,7 @@ for lat in ${pattern}; do {
 
   echo " ${lat} >> ${tgt_file}"
 
-  ( if [ "${WIP}" -eq 0 ]; then
+  ( if [ "$(echo "${WIP}" | awk '{print($1 != 0)}')" -eq 0 ]; then
       if [ -z "${vocab}" ]; then
         ${lattice_scale} --acoustic-scale="${ACWT}" --lm-scale="${LMWT}" "ark:gunzip -c ${lat} |" ark:- | \
         ${lattice_prune} --max-arcs="${MAX_ARCS}" --beam="${BEAM}" ark:- ark:- | \

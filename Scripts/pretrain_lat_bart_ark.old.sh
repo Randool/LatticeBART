@@ -9,6 +9,7 @@
 #SBATCH --exclude=gqxx-01-[008,011,016,020,033,083,093,105,110,116,125,139,145,146,152,167,174]
 #SBATCH --array=1,2,3,4
 
+hostname
 export PYTHONPATH="${HOME}/Projects/LatticeBART"
 
 lat_bart_path=none

@@ -1,5 +1,6 @@
 import json
 import os
+import warnings
 from os.path import join
 from typing import Optional, Iterable, Callable, List
 
@@ -177,9 +178,14 @@ class LatticeBart(BartPretrainedModel):
     def device(self):
         return next(self.parameters()).device
 
-    def save_pretrained(self, model_path: str):
+    def save_pretrained(self, model_path: str, save_config: bool = True, state_dict: Optional[dict] = None,
+                        save_function=torch.save, push_to_hub=False, **kwargs):
         os.makedirs(model_path, exist_ok=True)
-        torch.save(self.state_dict(), join(model_path, self.MODEL_PT))
+
+        if state_dict is None:
+            state_dict = self.state_dict()
+
+        torch.save(state_dict, join(model_path, self.MODEL_PT))
         with open(join(model_path, "config.json"), "w", encoding="utf8") as f:
             config = self.config.to_dict()
             json.dump(config, f, indent=2, ensure_ascii=False)
@@ -195,13 +201,16 @@ class LatticeBart(BartPretrainedModel):
         return lattice_bart
 
     @classmethod
-    def from_bart(cls, bart_path: str, lat_enc_layers: int):
+    def from_bart(cls, bart_path: str, lat_enc_layers: int = -1):
         bart = BartForConditionalGeneration.from_pretrained(bart_path)
         config = bart.config.to_dict()
 
         assert bart.config.encoder_layers >= lat_enc_layers, \
             f"lat_enc_layers({lat_enc_layers}) larger than " \
             f"bart.config.encoder_layers({bart.config.encoder_layers})"
+
+        if lat_enc_layers == -1:
+            lat_enc_layers = bart.config.encoder_layers
 
         config["lat_enc_layers"] = lat_enc_layers
         lattice_bart = cls(LatticeBartConfig.from_dict(config))
@@ -268,7 +277,10 @@ class LatticeBart(BartPretrainedModel):
             eos_token_id: Optional[int] = None,
             length_penalty: Optional[float] = None,
             no_repeat_ngram_size: Optional[int] = None,
+            encoder_no_repeat_ngram_size: Optional[int] = None,
             num_return_sequences: Optional[int] = None,
+            max_time: Optional[float] = None,
+            max_new_tokens: Optional[int] = None,
             decoder_start_token_id: Optional[int] = None,
             use_cache: Optional[bool] = None,
             num_beam_groups: Optional[int] = None,
@@ -278,14 +290,29 @@ class LatticeBart(BartPretrainedModel):
             output_hidden_states: Optional[bool] = None,
             output_scores: Optional[bool] = None,
             return_dict_in_generate: Optional[bool] = None,
+            forced_bos_token_id: Optional[int] = None,
+            forced_eos_token_id: Optional[int] = None,
+            remove_invalid_values: Optional[bool] = None,
+            synced_gpus: Optional[bool] = None,
             **model_kwargs,
     ):
         # set init values
+        if max_length is None and max_new_tokens is None:
+            # Both are None, default
+            max_length = self.config.max_length
+        elif max_length is not None and max_new_tokens is not None:
+            # Both are set, this is odd, raise a warning
+            warnings.warn(
+                "Both `max_length` and `max_new_tokens` have been set but they serve the same purpose.", UserWarning
+            )
+
+        max_length = max_length if max_length is not None else self.config.max_length
         num_beams = num_beams if num_beams is not None else self.config.num_beams
         num_beam_groups = num_beam_groups if num_beam_groups is not None else self.config.num_beam_groups
-        max_length = max_length if max_length is not None else self.config.max_length
         do_sample = do_sample if do_sample is not None else self.config.do_sample
-        num_return_sequences = num_return_sequences if num_return_sequences is not None else self.config.num_return_sequences
+        num_return_sequences = (
+            num_return_sequences if num_return_sequences is not None else self.config.num_return_sequences
+        )
 
         pad_token_id = pad_token_id if pad_token_id is not None else self.config.pad_token_id
         bos_token_id = bos_token_id if bos_token_id is not None else self.config.bos_token_id
@@ -293,8 +320,12 @@ class LatticeBart(BartPretrainedModel):
 
         output_scores = output_scores if output_scores is not None else self.config.output_scores
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        return_dict_in_generate = return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict_in_generate = (
+            return_dict_in_generate if return_dict_in_generate is not None else self.config.return_dict_in_generate
+        )
 
         model_kwargs["output_attentions"] = output_attentions
         model_kwargs["output_hidden_states"] = output_hidden_states
@@ -339,15 +370,24 @@ class LatticeBart(BartPretrainedModel):
         logits_processor = self._get_logits_processor(
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
-            encoder_no_repeat_ngram_size=0,
+            encoder_no_repeat_ngram_size=encoder_no_repeat_ngram_size,
             encoder_input_ids=None,
             bad_words_ids=bad_words_ids,
             min_length=min_length,
+            max_length=max_length,
             eos_token_id=eos_token_id,
+            forced_bos_token_id=forced_bos_token_id,
+            forced_eos_token_id=forced_eos_token_id,
             prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
             num_beams=num_beams,
             num_beam_groups=num_beam_groups,
             diversity_penalty=diversity_penalty,
+            remove_invalid_values=remove_invalid_values,
+        )
+
+        cur_len = input_ids.shape[-1]
+        stopping_criteria = self._get_stopping_criteria(
+            max_length=max_length, max_time=max_time, max_new_tokens=max_new_tokens, start_length=cur_len
         )
 
         if is_greedy_gen_mode:
@@ -360,11 +400,12 @@ class LatticeBart(BartPretrainedModel):
             return self.greedy_search(
                 input_ids,
                 logits_processor=logits_processor,
-                max_length=max_length,
+                stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 output_scores=output_scores,
                 return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
                 **model_kwargs,
             )
 
@@ -376,7 +417,10 @@ class LatticeBart(BartPretrainedModel):
 
             # expand input_ids with `num_return_sequences` additional sequences per batch
             input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids, num_return_sequences, **model_kwargs,
+                input_ids,
+                expand_size=num_return_sequences,
+                is_encoder_decoder=True,
+                **model_kwargs,
             )
 
             # sample
@@ -384,7 +428,7 @@ class LatticeBart(BartPretrainedModel):
                 input_ids,
                 logits_processor=logits_processor,
                 logits_warper=logits_wrapper,
-                max_length=max_length,
+                stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 output_scores=output_scores,
@@ -401,9 +445,11 @@ class LatticeBart(BartPretrainedModel):
             if num_return_sequences > num_beams:
                 raise ValueError("`num_return_sequences` has to be smaller or equal to `num_beams`.")
 
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+
             beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
-                max_length=max_length,
                 num_beams=num_beams,
                 device=self.device,
                 length_penalty=length_penalty,
@@ -411,17 +457,19 @@ class LatticeBart(BartPretrainedModel):
                 num_beam_hyps_to_keep=num_return_sequences,
             )
             # interleave with `num_beams`
-            input_ids, model_kwargs = self._expand_inputs_for_generation(input_ids, num_beams, **model_kwargs)
-
+            input_ids, model_kwargs = self._expand_inputs_for_generation(
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
+            )
             return self.beam_search(
                 input_ids,
                 beam_scorer,
                 logits_processor=logits_processor,
-                max_length=max_length,
+                stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 output_scores=output_scores,
                 return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
                 **model_kwargs,
             )
 
@@ -433,9 +481,10 @@ class LatticeBart(BartPretrainedModel):
             batch_size = input_ids.shape[0] * num_return_sequences
 
             length_penalty = length_penalty if length_penalty is not None else self.config.length_penalty
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
             beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
-                max_length=max_length,
                 num_beams=num_beams,
                 device=self.device,
                 length_penalty=length_penalty,
@@ -444,19 +493,23 @@ class LatticeBart(BartPretrainedModel):
 
             # interleave with `num_beams * num_return_sequences`
             input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids, num_beams * num_return_sequences, **model_kwargs,
+                input_ids,
+                expand_size=num_beams * num_return_sequences,
+                is_encoder_decoder=self.config.is_encoder_decoder,
+                **model_kwargs,
             )
 
             return self.beam_sample(
                 input_ids,
-                beam_scorer,
+                beam_scorer=beam_scorer,
                 logits_processor=logits_processor,
                 logits_warper=logits_wrapper,
-                max_length=max_length,
+                stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 output_scores=output_scores,
                 return_dict_in_generate=return_dict_in_generate,
+                synced_gpus=synced_gpus,
                 **model_kwargs,
             )
 
@@ -472,10 +525,13 @@ class LatticeBart(BartPretrainedModel):
             if num_beams % num_beam_groups != 0:
                 raise ValueError("`num_beams` should be divisible by `num_beam_groups` for group beam search.")
 
+            if stopping_criteria.max_length is None:
+                raise ValueError("`max_length` needs to be a stopping_criteria for now.")
+
             diverse_beam_scorer = BeamSearchScorer(
                 batch_size=batch_size,
-                max_length=max_length,
                 num_beams=num_beams,
+                max_length=stopping_criteria.max_length,
                 device=self.device,
                 length_penalty=length_penalty,
                 do_early_stopping=early_stopping,
@@ -484,13 +540,13 @@ class LatticeBart(BartPretrainedModel):
             )
             # interleave with `num_beams`
             input_ids, model_kwargs = self._expand_inputs_for_generation(
-                input_ids, num_beams, **model_kwargs
+                input_ids, expand_size=num_beams, is_encoder_decoder=self.config.is_encoder_decoder, **model_kwargs
             )
             return self.group_beam_search(
                 input_ids,
                 diverse_beam_scorer,
                 logits_processor=logits_processor,
-                max_length=max_length,
+                stopping_criteria=stopping_criteria,
                 pad_token_id=pad_token_id,
                 eos_token_id=eos_token_id,
                 output_scores=output_scores,
@@ -546,23 +602,20 @@ class LatticeBart(BartPretrainedModel):
 
         return input_ids, model_kwargs
 
-    def adjust_logits_during_generation(self, logits, cur_len, max_length):
-        if cur_len == 1 and self.config.force_bos_token_to_be_generated:
-            self._force_token_id_to_be_generated(logits, self.config.bos_token_id)
-        elif cur_len == max_length - 1 and self.config.eos_token_id is not None:
-            self._force_token_id_to_be_generated(logits, self.config.eos_token_id)
-        return logits
+    # def adjust_logits_during_generation(self, logits, cur_len):
+    #     if cur_len == 1 and self.config.force_bos_token_to_be_generated:
+    #         self._force_token_id_to_be_generated(logits, self.config.bos_token_id)
+    #     elif cur_len == max_length - 1 and self.config.eos_token_id is not None:
+    #         self._force_token_id_to_be_generated(logits, self.config.eos_token_id)
+    #     return logits
 
-    @staticmethod
-    def _force_token_id_to_be_generated(scores, token_id) -> None:
-        """force one of token_ids to be generated by setting prob of all other tokens to 0 (logprob=-float("inf"))"""
-        scores[:, [x for x in range(scores.shape[1]) if x != token_id]] = -float("inf")
+    # @staticmethod
+    # def _force_token_id_to_be_generated(scores, token_id) -> None:
+    #     """force one of token_ids to be generated by setting prob of all other tokens to 0 (logprob=-float("inf"))"""
+    #     scores[:, [x for x in range(scores.shape[1]) if x != token_id]] = -float("inf")
 
     def _reorder_cache(self, past, beam_idx):
         reordered_past = ()
         for layer_past in past:
-            # cached cross_attention states don't have to be reordered -> they are always the same
-            reordered_past += (
-                tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
-            )
+            reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
         return reordered_past

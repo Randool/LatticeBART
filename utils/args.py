@@ -1,24 +1,47 @@
+import json
 import os
 import re
 from argparse import ArgumentParser, Namespace
+from dataclasses import dataclass, field, asdict
 from os.path import join
+from typing import Optional, List
 
 import torch
 
 PHONE_EMBED_CHOICE = ("none", "unstressed", "stressed")
 
 
+@dataclass
+class _Args:
+    def to_dict(self):
+        return asdict(self)
+
+    def to_json_string(self):
+        return json.dumps(self.to_dict(), indent=2)
+
+
 def add_args_for_model_construct(parser: ArgumentParser):
     p = parser.add_argument_group("Model construct")
     p.add_argument("--default_config", type=str, choices=("tiny", "base", "large"), help="Select configurations")
 
-    p.add_argument("--lat_enc_layers", type=int, default=1, help="LatticeEncoder layers")
+    p.add_argument("--lat_enc_layers", type=int, default=-1, help="LatticeEncoder layers")
 
     p.add_argument("--bart_path", type=str, help="Pretrained Bart path")
     p.add_argument("--init_model", type=int, choices=(0, 1), default=0, help="Init all model's parameters")
 
     p.add_argument("--lat_bart_path", type=str, help="Pretrained LatticeBart path")
     p.add_argument("--lat_encoder", type=str, help="Pretrained LatticeEncoder path")
+
+
+@dataclass
+class ModelConstructArgs(_Args):
+    default_config: Optional[str] = field(default=None, metadata={"choices": ["tiny", "base", "large"],
+                                                                  "help": "Model configuration"})
+    lat_enc_layers: Optional[int] = field(default=-1, metadata={"help": "LatticeEncoder layers"})
+    bart_path: Optional[str] = field(default=None, metadata={"help": "Pretrained BART path"})
+    init_model: Optional[int] = field(default=0, metadata={"choices": [0, 1], "help": "Init model's parameters"})
+    lat_bart_path: Optional[str] = field(default=None, metadata={"help": "Pretrained LatticeBART path"})
+    lat_encoder: Optional[str] = field(default=None, metadata={"help": "Pretrained LatticeEncoder path"})
 
 
 def add_args_for_lr(parser: ArgumentParser):
@@ -47,6 +70,44 @@ def add_args_for_data_path(parser: ArgumentParser):
     p.add_argument("--train_text", type=str, help="/path/to/text")
     p.add_argument("--eval_text", type=str, help="/path/to/text")
     p.add_argument("--test_text", type=str, nargs="*", default=[], help="/path/to/text")
+
+
+@dataclass
+class DataArgs(_Args):
+    train_lat: Optional[str] = field(default=None, metadata={"help": "/path/to/lattice_for_train"})
+    eval_lat: Optional[str] = field(default=None, metadata={"help": "/path/to/lattice_for_eval"})
+    test_lat: List[str] = field(default_factory=lambda: [], metadata={"help": "/path/to/lattice_for_test"})
+    debug_lat: Optional[str] = field(default=None, metadata={"help": "/path/to/lattice_for_debug"})
+
+    train_lat_ark: Optional[str] = field(default=None, metadata={"help": "/path/to/lattice_ark_for_train"})
+    eval_lat_ark: Optional[str] = field(default=None, metadata={"help": "/path/to/lattice_ark_for_eval"})
+    test_lat_ark: List[str] = field(default_factory=lambda: [], metadata={"help": "/path/to/lattice_ark_for_test"})
+    debug_lat_ark: Optional[str] = field(default=None, metadata={"help": "/path/to/lattice_ark_for_debug"})
+
+    train_text: Optional[str] = field(default=None, metadata={"help": "/path/to/text_for_train"})
+    eval_text: Optional[str] = field(default=None, metadata={"help": "/path/to/text_for_eval"})
+    test_text: List[str] = field(default_factory=lambda: [], metadata={"help": "/path/to/text_for_test"})
+
+    # Data process
+    lm_scale: Optional[float] = field(default=1.0, metadata={"help": "Language model score scale ratio"})
+    ac_scale: Optional[float] = field(default=1.0, metadata={"help": "Acoustic model score scale ratio"})
+
+    min_nodes: Optional[int] = field(default=0, metadata={"help": "Minimal node count in lattice"})
+    max_nodes: Optional[int] = field(default=256, metadata={"help": "Maximum node count in lattice"})
+
+    use_marginal: Optional[float] = field(default=1.0, metadata={"help": "Prob. of using marginal scores"})
+    use_min_depth: Optional[float] = field(default=1.0, metadata={"help": "Prob. of using min depths"})
+    use_max_depth: Optional[float] = field(default=1.0, metadata={"help": "Prob. of using max depths"})
+    use_forward_backward: Optional[float] = field(default=1.0,
+                                                  metadata={"help": "Prob. of using forward-backward scores"})
+    use_lattice_mask: Optional[float] = field(default=1.0, metadata={"help": "Prob. of using lattice mask"})
+
+    homophone_replace: Optional[float] = field(default=0, metadata={"help": "Prob. of replacing token with homophone"})
+    token_mask: Optional[float] = field(default=0, metadata={"help": "Prob. of masking nodes"})
+    depth_disturb: Optional[int] = field(default=0, metadata={"help": "Prob. of adding disturbing depth to nodes"})
+
+    decoder_input: Optional[str] = field(default="sent",
+                                         metadata={"choices": ["sent", "lattice"], "help": "Decoder inputs"})
 
 
 def add_args_for_data_process(parser: ArgumentParser):
@@ -113,6 +174,12 @@ def add_args_for_seq2seq_generation(parser: ArgumentParser):
     p.add_argument("--min_len", type=int, required=True)
     p.add_argument("--max_len", type=int, required=True)
     # p.add_argument("--constrain", type=int, choices=(0, 1), default=0, help="Do beam search with constrain")
+
+
+@dataclass
+class GenArgs:
+    num_beams: Optional[int] = field(default=1)
+    max_length: Optional[int] = field(default=128, metadata={"help": "Max length of decoding steps"})
 
 
 ####### CONFIG #######
